@@ -1,2366 +1,1817 @@
-require("dotenv").config();
+"use strict";
 
 const express = require("express");
 const session = require("express-session");
-const SQLiteStore = require("connect-sqlite3")(session);
 const bcrypt = require("bcryptjs");
-const helmet = require("helmet");
+const Database = require("better-sqlite3");
 const rateLimit = require("express-rate-limit");
+const helmet = require("helmet");
 const nodemailer = require("nodemailer");
-const sqlite3 = require("sqlite3").verbose();
 const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 
 const app = express();
 
-const PORT = Number(process.env.PORT || 10000);
-const PRODUCTION = process.env.NODE_ENV === "production";
+const PORT = process.env.PORT || 10000;
+const NODE_ENV = process.env.NODE_ENV || "development";
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "data");
+const SESSION_SECRET =
+  process.env.SESSION_SECRET || "development-only-change-this-secret";
 
-if (PRODUCTION) {
-if (!process.env.SESSION_SECRET ||
-process.env.SESSION_SECRET.length < 32) {
-throw new Error(
-"Set SESSION_SECRET to a random value of at least 32 characters."
-);
+if (NODE_ENV === "production" && SESSION_SECRET.length < 32) {
+  throw new Error("SESSION_SECRET must contain at least 32 characters in production.");
 }
 
-if (!process.env.BASE_URL ||
-!process.env.BASE_URL.startsWith("https://")) {
-throw new Error("Set BASE_URL to your public HTTPS Render URL.");
-}
+fs.mkdirSync(DATA_DIR, { recursive: true });
 
-if (!process.env.DATA_DIR) {
-throw new Error(
-"Set DATA_DIR to the mount path of your Render persistent disk."
-);
-}
-}
+/* =========================================================
+   DATABASE
+========================================================= */
 
-const DATA_DIR = path.resolve(
-process.env.DATA_DIR || path.join(__dirname, "data")
-);
+const db = new Database(path.join(DATA_DIR, "yjik.sqlite"));
 
-fs.mkdirSync(DATA_DIR, {
-recursive: true,
-mode: 0o700
-});
+db.pragma("journal_mode = WAL");
+db.pragma("foreign_keys = ON");
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    email TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS contact_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    email TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    message TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS donation_pledges (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    email TEXT NOT NULL,
+    amount REAL NOT NULL,
+    message TEXT DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'Pledge received',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS password_resets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    token_hash TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
+    used INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+  );
+`);
+
+/* =========================================================
+   SECURITY AND MIDDLEWARE
+========================================================= */
 
 app.disable("x-powered-by");
 
-if (PRODUCTION) {
-app.set("trust proxy", 1);
-}
-
-app.use(helmet({
-contentSecurityPolicy: {
-directives: {
-defaultSrc: ["'self'"],
-scriptSrc: ["'self'", "'unsafe-inline'"],
-styleSrc: ["'self'", "'unsafe-inline'"],
-imgSrc: ["'self'", "data:", "https:"],
-formAction: ["'self'"],
-objectSrc: ["'none'"],
-baseUri: ["'self'"],
-frameAncestors: ["'none'"]
-}
-}
-}));
-
-app.use(express.urlencoded({
-extended: false,
-limit: "20kb"
-}));
-
-app.use(express.json({
-limit: "20kb"
-}));
-
-app.use(rateLimit({
-windowMs: 15 * 60 * 1000,
-limit: 200,
-standardHeaders: "draft-8",
-legacyHeaders: false
-}));
-
-// --------------------------------------------------
-// SQLITE DATABASE
-// --------------------------------------------------
-
-const db = new sqlite3.Database(
-path.join(DATA_DIR, "yjik.sqlite")
+app.use(
+  helmet({
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'self'"],
+        scriptSrc: ["'self'", "'unsafe-inline'"],
+        styleSrc: ["'self'", "'unsafe-inline'"],
+        imgSrc: ["'self'", "data:", "https:"],
+        connectSrc: ["'self'"],
+        fontSrc: ["'self'", "https:", "data:"],
+        objectSrc: ["'none'"],
+        frameAncestors: ["'none'"],
+        upgradeInsecureRequests:
+          NODE_ENV === "production" ? [] : null
+      }
+    }
+  })
 );
 
-db.configure("busyTimeout", 10000);
+app.use(express.urlencoded({ extended: false, limit: "20kb" }));
+app.use(express.json({ limit: "20kb" }));
 
-db.run("PRAGMA foreign_keys = ON");
+app.use(
+  rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: 200,
+    standardHeaders: "draft-7",
+    legacyHeaders: false
+  })
+);
 
-function run(sql, params = []) {
-return new Promise((resolve, reject) => {
-db.run(sql, params, function (err) {
-if (err) return reject(err);
+app.use(
+  session({
+    name: "yjik.sid",
+    secret: SESSION_SECRET,
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+      httpOnly: true,
+      secure: NODE_ENV === "production",
+      sameSite: "lax",
+      maxAge: 1000 * 60 * 60 * 8
+    }
+  })
+);
 
-  resolve({
-    id: this.lastID,
-    changes: this.changes
+/* =========================================================
+   EMAIL CONFIGURATION
+========================================================= */
+
+let transporter = null;
+
+if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
+  transporter = nodemailer.createTransport({
+    host: process.env.SMTP_HOST,
+    port: Number(process.env.SMTP_PORT || 587),
+    secure: String(process.env.SMTP_SECURE || "false") === "true",
+    auth: {
+      user: process.env.SMTP_USER,
+      pass: process.env.SMTP_PASS
+    }
   });
-});
-
-});
 }
 
-function get(sql, params = []) {
-return new Promise((resolve, reject) => {
-db.get(sql, params, (err, row) => {
-if (err) return reject(err);
-
-  resolve(row);
-});
-
-});
-}
-
-function all(sql, params = []) {
-return new Promise((resolve, reject) => {
-db.all(sql, params, (err, rows) => {
-if (err) return reject(err);
-
-  resolve(rows);
-});
-
-});
-}
-
-async function initialiseDatabase() {
-await run("CREATE TABLE IF NOT EXISTS users ( id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, email TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP )");
-
-await run("CREATE TABLE IF NOT EXISTS password_resets ( id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, token_hash TEXT NOT NULL UNIQUE, expires_at INTEGER NOT NULL, FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE )");
-
-await run("CREATE TABLE IF NOT EXISTS contact_messages ( id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, email TEXT NOT NULL, subject TEXT NOT NULL, message TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP )");
-
-await run("CREATE TABLE IF NOT EXISTS donations ( id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, email TEXT NOT NULL, amount INTEGER NOT NULL, programme TEXT NOT NULL, message TEXT DEFAULT '', status TEXT NOT NULL DEFAULT 'pledged', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP )");
-
-console.log("SQLite database ready.");
-}
-
-// --------------------------------------------------
-// EMAIL CONFIGURATION
-// --------------------------------------------------
-
-let mailer = null;
-
-if (
-process.env.SMTP_HOST &&
-process.env.SMTP_USER &&
-process.env.SMTP_PASS
-) {
-mailer = nodemailer.createTransport({
-host: process.env.SMTP_HOST,
-port: Number(process.env.SMTP_PORT || 587),
-secure: process.env.SMTP_SECURE === "true",
-auth: {
-user: process.env.SMTP_USER,
-pass: process.env.SMTP_PASS
-}
-});
-}
-
-async function sendEmail(options) {
-if (!mailer) {
-console.warn("SMTP is not configured; email was not sent.");
-return false;
-}
-
-await mailer.sendMail({
-from: process.env.MAIL_FROM || process.env.SMTP_USER,
-...options
-});
-
-return true;
-}
-
-// --------------------------------------------------
-// SESSIONS
-// --------------------------------------------------
-
-app.use(session({
-name: "yjik.sid",
-
-secret: PRODUCTION
-? process.env.SESSION_SECRET
-: (process.env.SESSION_SECRET || "local-development-secret-change-me"),
-
-store: new SQLiteStore({
-db: "sessions.sqlite",
-dir: DATA_DIR
-}),
-
-resave: false,
-saveUninitialized: false,
-
-cookie: {
-httpOnly: true,
-secure: PRODUCTION,
-sameSite: "lax",
-maxAge: 8 * 60 * 60 * 1000
-}
-}));
-
-// --------------------------------------------------
-// HELPERS
-// --------------------------------------------------
+/* =========================================================
+   HELPER FUNCTIONS
+========================================================= */
 
 function escapeHTML(value = "") {
-return String(value).replace(/[&<>"']/g, ch => ({
-"&": "&",
-"<": "<",
-">": ">",
-'"': """,
-"'": "'"
-})[ch]);
-}
+  const entities = {
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;"
+  };
 
-function emailNormal(value = "") {
-return String(value).trim().toLowerCase();
+  return String(value).replace(/[&<>"']/g, ch => entities[ch]);
 }
 
 function validEmail(value) {
-return /^[^\s@]+@[^\s@]+.[^\s@]+$/.test(value);
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
 }
 
-function validPassword(value) {
-return typeof value === "string" &&
-value.length >= 12 &&
-Buffer.byteLength(value, "utf8") <= 72;
+function publicURL(req) {
+  if (process.env.BASE_URL) {
+    return process.env.BASE_URL.replace(/\/+$/, "");
+  }
+
+  return `${req.protocol}://${req.get("host")}`;
 }
 
-function flashRedirect(res, pathName, message) {
-res.redirect(
-pathName + "?message=" + encodeURIComponent(message)
-);
+function currentUser(req) {
+  if (!req.session.userId) {
+    return null;
+  }
+
+  return (
+    db
+      .prepare("SELECT id, name, email, created_at FROM users WHERE id = ?")
+      .get(req.session.userId) || null
+  );
 }
 
 function requireLogin(req, res, next) {
-if (!req.session.user) {
-return flashRedirect(
-res,
-"/login",
-"Please log in to access your dashboard."
-);
+  if (!req.session.userId || !currentUser(req)) {
+    return res.redirect("/login?message=" + encodeURIComponent("Please log in first."));
+  }
+
+  next();
 }
 
-next();
+function redirectMessage(res, pathName, message) {
+  return res.redirect(
+    `${pathName}?message=${encodeURIComponent(message)}`
+  );
 }
 
-function regenerateSession(req) {
-return new Promise((resolve, reject) => {
-req.session.regenerate(err => err ? reject(err) : resolve());
-});
+function pageHeader(title, description) {
+  return `
+    <section class="page-header">
+      <h1>${escapeHTML(title)}</h1>
+      <p>${escapeHTML(description)}</p>
+    </section>
+  `;
 }
 
-function saveSession(req) {
-return new Promise((resolve, reject) => {
-req.session.save(err => err ? reject(err) : resolve());
-});
-}
+function renderPage(req, title, content) {
+  const user = currentUser(req);
 
-function destroySession(req) {
-return new Promise((resolve, reject) => {
-req.session.destroy(err => err ? reject(err) : resolve());
-});
-}
+  const nav = user
+    ? `
+      <a href="/dashboard">Dashboard</a>
+      <form method="POST" action="/logout" class="logout-form">
+        <button type="submit" class="nav-join">Logout</button>
+      </form>
+    `
+    : `
+      <a href="/login">Login</a>
+      <a class="nav-join" href="/signup">Join Us</a>
+    `;
 
-function publicURL(req, route) {
-const base = process.env.BASE_URL ||
-"${req.protocol}://${req.get("host")}";
+  const notice = req.query.message
+    ? `<div class="notice" role="status">${escapeHTML(req.query.message)}</div>`
+    : "";
 
-return new URL(route, base).toString();
-}
-
-const authLimiter = rateLimit({
-windowMs: 15 * 60 * 1000,
-limit: 10,
-standardHeaders: "draft-8",
-legacyHeaders: false
-});
-
-const formLimiter = rateLimit({
-windowMs: 15 * 60 * 1000,
-limit: 8,
-standardHeaders: "draft-8",
-legacyHeaders: false
-});
-
-// --------------------------------------------------
-// INLINE HTML, CSS AND JAVASCRIPT
-// --------------------------------------------------
-
-function renderPage(title, content, req) {
-const user = req.session.user;
-
-const nav = user
-? "<a href="/dashboard">Dashboard</a> <a href="/logout">Logout</a>"
-: "<a href="/login">Login</a> <a class="nav-join" href="/signup">Join Us</a>";
-
-const notice = req.query.message
-? "<div class="notice">${escapeHTML(req.query.message)}</div>"
-: "";
-
-return `<!DOCTYPE html>
-
+  return `<!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="theme-color" content="#105a38">
-<meta name="description" content="Youth Justice Initiative Kenya promotes youth rights, access to justice, legal awareness, community safety and youth empowerment.">
-<title>${escapeHTML(title)} | Youth Justice Initiative Kenya</title><style>
-:root {
-  --green: #105a38;
-  --dark: #083b25;
-  --deep: #052d1b;
-  --lime: #c8f169;
-  --mint: #eaf7ee;
-  --pale: #f5faf6;
-  --white: #ffffff;
-  --text: #21362a;
-  --muted: #66786c;
-  --border: #dce9df;
-  --shadow: 0 12px 36px rgba(8,59,37,.09);
-}
-
-* { box-sizing: border-box; }
-
-html { scroll-behavior: smooth; }
-
-body {
-  margin: 0;
-  color: var(--text);
-  background: var(--pale);
-  font-family: Arial, Helvetica, sans-serif;
-  line-height: 1.7;
-}
-
-a { color: var(--green); }
-
-button, input, textarea, select { font: inherit; }
-
-button { cursor: pointer; }
-
-.topbar {
-  background: var(--deep);
-  color: white;
-  text-align: center;
-  padding: 8px 16px;
-  font-size: 12px;
-}
-
-.navbar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 20px;
-  padding: 15px 5%;
-  background: white;
-  border-bottom: 1px solid var(--border);
-  position: sticky;
-  top: 0;
-  z-index: 20;
-}
-
-.brand {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  text-decoration: none;
-  color: var(--dark);
-}
-
-.brand-icon {
-  display: grid;
-  place-items: center;
-  width: 46px;
-  height: 46px;
-  border-radius: 13px;
-  background: var(--green);
-  color: var(--lime);
-  font-weight: 900;
-}
-
-.brand strong {
-  display: block;
-  font-size: 14px;
-  line-height: 1.4;
-}
-
-.brand small {
-  display: block;
-  font-size: 11px;
-  color: var(--muted);
-}
-
-.nav-links {
-  display: flex;
-  align-items: center;
-  gap: 19px;
-}
-
-.nav-links a {
-  color: var(--text);
-  font-size: 13px;
-  font-weight: 700;
-  text-decoration: none;
-}
-
-.nav-links a:hover { color: var(--green); }
-
-.nav-join {
-  padding: 10px 16px;
-  border-radius: 8px;
-  background: var(--green);
-  color: white !important;
-}
-
-.menu-toggle {
-  display: none;
-  background: var(--green);
-  color: white;
-  border: 0;
-  padding: 9px 12px;
-  border-radius: 7px;
-}
-
-.button {
-  display: inline-block;
-  padding: 12px 19px;
-  border-radius: 8px;
-  border: 0;
-  background: var(--green);
-  color: white;
-  text-decoration: none;
-  font-weight: 700;
-}
-
-.button:hover { background: var(--dark); }
-
-.button.lime {
-  background: var(--lime);
-  color: var(--deep);
-}
-
-.button.light {
-  background: white;
-  color: var(--green);
-}
-
-.hero {
-  background:
-    radial-gradient(circle at 85% 15%, rgba(200,241,105,.18), transparent 32%),
-    linear-gradient(135deg, #083b25, #167347);
-  color: white;
-  padding: 88px 7%;
-}
-
-.hero-inner {
-  max-width: 1200px;
-  margin: auto;
-  display: grid;
-  grid-template-columns: 1.35fr .8fr;
-  gap: 48px;
-  align-items: center;
-}
-
-.eyebrow {
-  color: var(--lime);
-  font-weight: 800;
-  letter-spacing: 2px;
-  font-size: 12px;
-  text-transform: uppercase;
-}
-
-.hero h1 {
-  font-size: clamp(36px, 5vw, 62px);
-  line-height: 1.12;
-  letter-spacing: -1.5px;
-  margin: 18px 0;
-}
-
-.hero p {
-  max-width: 680px;
-  color: #e0eee5;
-  font-size: 17px;
-}
-
-.hero-actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 12px;
-  margin-top: 28px;
-}
-
-.hero-box {
-  padding: 28px;
-  border-radius: 18px;
-  background: rgba(255,255,255,.09);
-  border: 1px solid rgba(255,255,255,.16);
-}
-
-.hero-box h3 { color: var(--lime); }
-
-.hero-box li { margin: 10px 0; }
-
-.section { padding: 72px 7%; }
-
-.section.white { background: white; }
-
-.section-heading {
-  max-width: 780px;
-  margin: 0 auto 38px;
-  text-align: center;
-}
-
-.section-heading h2 {
-  color: var(--dark);
-  font-size: clamp(28px, 4vw, 42px);
-  line-height: 1.2;
-  margin: 12px 0;
-}
-
-.section-heading p { color: var(--muted); }
-
-.grid {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 22px;
-  max-width: 1200px;
-  margin: auto;
-}
-
-.grid.two {
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-}
-
-.card {
-  background: white;
-  padding: 25px;
-  border: 1px solid var(--border);
-  border-radius: 14px;
-  box-shadow: var(--shadow);
-}
-
-.card h3 { color: var(--green); }
-
-.card p { color: var(--muted); }
-
-.icon { font-size: 30px; }
-
-.green-section {
-  background: var(--green);
-  color: white;
-}
-
-.green-section .section-heading h2 { color: white; }
-
-.green-section .section-heading p { color: #dcece2; }
-
-.green-section .card {
-  background: rgba(255,255,255,.08);
-  border-color: rgba(255,255,255,.16);
-  box-shadow: none;
-}
-
-.green-section .card h3 { color: var(--lime); }
-
-.green-section .card p { color: #e2eee6; }
-
-.page-header {
-  padding: 55px 7%;
-  text-align: center;
-  color: white;
-  background: linear-gradient(130deg, var(--deep), var(--green));
-}
-
-.page-header h1 {
-  font-size: clamp(32px, 5vw, 46px);
-  margin: 0 0 10px;
-}
-
-.page-header p {
-  max-width: 760px;
-  margin: auto;
-  color: #e0eee5;
-}
-
-.content {
-  max-width: 1000px;
-  margin: auto;
-}
-
-.content h2 { color: var(--green); }
-
-.form-wrap {
-  max-width: 560px;
-  margin: 40px auto;
-  padding: 30px;
-  background: white;
-  border: 1px solid var(--border);
-  border-radius: 16px;
-  box-shadow: var(--shadow);
-}
-
-.form-wrap h1, .form-wrap h2 { color: var(--green); }
-
-.form-wrap > p { color: var(--muted); }
-
-.field { margin: 16px 0; }
-
-label {
-  display: block;
-  font-size: 14px;
-  font-weight: 700;
-  margin-bottom: 7px;
-}
-
-input, textarea, select {
-  width: 100%;
-  padding: 12px;
-  border: 1px solid #cbdccf;
-  border-radius: 8px;
-  background: white;
-  color: var(--text);
-}
-
-input:focus, textarea:focus, select:focus {
-  outline: 2px solid #72bc8d;
-  border-color: var(--green);
-}
-
-input[type=checkbox] { width: auto; }
-
-textarea { min-height: 125px; resize: vertical; }
-
-.full { width: 100%; }
-
-.help { color: var(--muted); font-size: 12px; }
-
-.notice {
-  max-width: 900px;
-  margin: 16px auto;
-  padding: 13px 18px;
-  background: var(--mint);
-  border: 1px solid #b6dfc3;
-  color: var(--dark);
-  border-radius: 9px;
-  text-align: center;
-}
-
-.dashboard-shell {
-  min-height: 600px;
-  background: #eaf5ed;
-  padding: 35px 5%;
-}
-
-.dashboard {
-  max-width: 1250px;
-  margin: auto;
-  display: grid;
-  grid-template-columns: 250px 1fr;
-  gap: 24px;
-}
-
-.sidebar {
-  background: var(--dark);
-  color: white;
-  padding: 24px 17px;
-  border-radius: 17px;
-  align-self: start;
-  box-shadow: var(--shadow);
-}
-
-.sidebar h3 {
-  color: var(--lime);
-  padding: 0 10px;
-}
-
-.sidebar a {
-  display: block;
-  color: white;
-  text-decoration: none;
-  padding: 11px 12px;
-  border-radius: 8px;
-  margin: 5px 0;
-}
-
-.sidebar a:hover, .sidebar a.active {
-  background: #176c43;
-}
-
-.dash-main { min-width: 0; }
-
-.dash-heading {
-  background: linear-gradient(120deg, #105a38, #218453);
-  color: white;
-  padding: 27px;
-  border-radius: 16px;
-  box-shadow: var(--shadow);
-}
-
-.dash-heading h1 { margin: 0; }
-
-.dash-heading p { color: #e1f0e5; }
-
-.stat-grid {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 17px;
-  margin: 20px 0;
-}
-
-.stat-card {
-  background: white;
-  border: 1px solid var(--border);
-  border-left: 5px solid var(--green);
-  padding: 20px;
-  border-radius: 12px;
-}
-
-.stat-card strong {
-  display: block;
-  font-size: 25px;
-  color: var(--green);
-}
-
-.stat-card span {
-  color: var(--muted);
-  font-size: 13px;
-}
-
-.dash-panel {
-  padding: 25px;
-  background: white;
-  border: 1px solid var(--border);
-  border-radius: 14px;
-  margin-bottom: 20px;
-}
-
-.dash-panel h2 { color: var(--green); }
-
-.action-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 15px;
-}
-
-.action-card {
-  background: #f3faf4;
-  border: 1px solid var(--border);
-  padding: 19px;
-  border-radius: 12px;
-}
-
-.action-card h3 { color: var(--green); }
-
-.action-card a {
-  font-weight: 700;
-  text-decoration: none;
-}
-
-.cta {
-  text-align: center;
-  background: #e2f3e6;
-}
-
-.cta h2 { color: var(--dark); }
-
-.footer {
-  background: var(--deep);
-  color: #dce9df;
-  padding: 50px 7% 20px;
-}
-
-.footer-grid {
-  max-width: 1200px;
-  margin: auto;
-  display: grid;
-  grid-template-columns: 2fr 1fr 1fr;
-  gap: 30px;
-}
-
-.footer h3, .footer h4 { color: var(--lime); }
-
-.footer a {
-  display: block;
-  margin: 8px 0;
-  color: #e1ece4;
-  text-decoration: none;
-  font-size: 14px;
-}
-
-.copyright {
-  max-width: 1200px;
-  margin: 30px auto 0;
-  padding-top: 18px;
-  border-top: 1px solid rgba(255,255,255,.15);
-  color: #b8cdbd;
-  font-size: 12px;
-}
-
-@media (max-width: 950px) {
-  .menu-toggle { display: block; }
-
-  .navbar { flex-wrap: wrap; }
-
-  .nav-links {
-    display: none;
-    width: 100%;
-    flex-direction: column;
-    align-items: stretch;
-    gap: 10px;
-    padding: 10px 0;
-  }
-
-  .nav-links.open { display: flex; }
-
-  .nav-links a { padding: 7px 0; }
-
-  .hero-inner { grid-template-columns: 1fr; }
-
-  .dashboard { grid-template-columns: 1fr; }
-
-  .sidebar { display: grid; grid-template-columns: repeat(2, 1fr); }
-
-  .sidebar h3 { grid-column: 1 / -1; }
-
-  .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-}
-
-@media (max-width: 600px) {
-  .hero { padding: 55px 6%; }
-
-  .section { padding: 50px 6%; }
-
-  .grid, .grid.two, .footer-grid,
-  .stat-grid, .action-grid {
-    grid-template-columns: 1fr;
-  }
-
-  .form-wrap { margin: 24px 5%; padding: 22px; }
-
-  .dashboard-shell { padding: 20px 4%; }
-
-  .sidebar { grid-template-columns: 1fr; }
-
-  .brand strong { font-size: 12px; }
-}
-</style></head><body>
-<div class="topbar">
-  Advancing youth rights, justice, dignity and opportunity in Kenya.
-</div><nav class="navbar">
-  <a class="brand" href="/">
-    <span class="brand-icon">YJ</span>
-    <span>
-      <strong>Youth Justice Initiative Kenya</strong>
-      <small>Justice • Dignity • Opportunity</small>
-    </span>
-  </a><button
-id="menuToggle"
-class="menu-toggle"
-type="button"
-aria-expanded="false"
-aria-controls="navLinks"
-
-«Menu ☰</button>»
-
-  <div class="nav-links" id="navLinks">
-    <a href="/">Home</a>
-    <a href="/about">About Us</a>
-    <a href="/programmes">Programmes</a>
-    <a href="/contact">Contact</a>
-    <a href="/donate">Donate</a>
-    ${nav}
-  </div>
-</nav>${notice}
-
-<main>${content}</main><footer class="footer">
-  <div class="footer-grid">
-    <div>
-      <h3>Youth Justice Initiative Kenya</h3>  <p>
-    Promoting youth rights awareness, access to justice,
-    legal awareness, community safety and youth empowerment.
-  </p>
-
-  <p>
-    Community presence: Lurende Market, Khatiri,
-    Bungoma County, Kenya.
-  </p>
-
-  <p>
-    Our programme descriptions represent intended areas of work.
-    Actual activities depend on available resources and capacity.
-  </p>
-</div>
-
-<div>
-  <h4>Explore</h4>
-  <a href="/about">About Us</a>
-  <a href="/programmes">Our Programmes</a>
-  <a href="/contact">Contact Us</a>
-  <a href="/privacy">Privacy</a>
-</div>
-
-<div>
-  <h4>Get Involved</h4>
-  <a href="/signup">Join Our Community</a>
-  <a href="/donate">Support Our Work</a>
-  <a href="/login">Member Login</a>
-</div>
-
-  </div>  <div class="copyright">
-    © ${new Date().getFullYear()} Youth Justice Initiative Kenya.
-    All rights reserved.
-    <br>
-    This website is not a substitute for professional legal advice
-    or emergency services.
-  </div>
-</footer><script>
-  const menuButton = document.getElementById("menuToggle");
-  const nav = document.getElementById("navLinks");
-
-  menuButton.addEventListener("click", () => {
-    const open = nav.classList.toggle("open");
-    menuButton.setAttribute("aria-expanded", String(open));
-  });
-
-  document.querySelectorAll("form[data-validate]").forEach(form => {
-    form.addEventListener("submit", event => {
-      if (!form.checkValidity()) {
-        event.preventDefault();
-        form.reportValidity();
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="Youth Justice Initiative Kenya promotes youth rights, access to justice, legal awareness, community safety and youth empowerment.">
+  <title>${escapeHTML(title)} | Youth Justice Initiative Kenya</title>
+
+  <style>
+    :root {
+      --green: #126b3a;
+      --dark-green: #084526;
+      --light-green: #eaf5ee;
+      --gold: #f2c94c;
+      --text: #202a24;
+      --muted: #627067;
+      --border: #dce5de;
+      --background: #f7faf8;
+      --white: #ffffff;
+      --danger: #a61b1b;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html {
+      scroll-behavior: smooth;
+    }
+
+    body {
+      margin: 0;
+      font-family: Arial, Helvetica, sans-serif;
+      line-height: 1.65;
+      color: var(--text);
+      background: var(--background);
+    }
+
+    a {
+      color: var(--green);
+    }
+
+    .container {
+      width: min(1120px, 92%);
+      margin: 0 auto;
+    }
+
+    header {
+      background: var(--white);
+      border-bottom: 1px solid var(--border);
+      position: sticky;
+      top: 0;
+      z-index: 10;
+    }
+
+    .navbar {
+      min-height: 76px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 18px;
+    }
+
+    .brand {
+      color: var(--dark-green);
+      font-weight: 800;
+      font-size: 17px;
+      line-height: 1.3;
+      text-decoration: none;
+      max-width: 290px;
+    }
+
+    .nav-links {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+    }
+
+    .nav-links a {
+      text-decoration: none;
+      font-weight: 600;
+    }
+
+    .nav-join {
+      display: inline-block;
+      background: var(--green);
+      color: var(--white);
+      border: 0;
+      border-radius: 6px;
+      padding: 10px 16px;
+      text-decoration: none;
+      font: inherit;
+      font-weight: 700;
+      cursor: pointer;
+    }
+
+    .logout-form {
+      display: inline;
+      margin: 0;
+    }
+
+    .menu-toggle {
+      display: none;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 8px 12px;
+      background: var(--white);
+      cursor: pointer;
+    }
+
+    main {
+      min-height: 70vh;
+    }
+
+    .hero {
+      padding: 90px 0;
+      color: var(--white);
+      background: linear-gradient(135deg, var(--dark-green), var(--green));
+    }
+
+    .hero h1 {
+      max-width: 800px;
+      font-size: clamp(34px, 5vw, 58px);
+      line-height: 1.15;
+      margin: 0 0 20px;
+    }
+
+    .hero p {
+      max-width: 760px;
+      font-size: 19px;
+      margin-bottom: 28px;
+    }
+
+    .hero .button {
+      background: var(--gold);
+      color: #183b26;
+    }
+
+    .button {
+      display: inline-block;
+      padding: 12px 20px;
+      border: 0;
+      border-radius: 6px;
+      background: var(--green);
+      color: var(--white);
+      text-decoration: none;
+      font-weight: 700;
+      cursor: pointer;
+      font-size: 15px;
+    }
+
+    .button-secondary {
+      background: var(--white);
+      color: var(--green);
+      border: 1px solid var(--green);
+    }
+
+    .section {
+      padding: 55px 0;
+    }
+
+    .section h2 {
+      color: var(--dark-green);
+      line-height: 1.25;
+    }
+
+    .section-intro {
+      max-width: 780px;
+      color: var(--muted);
+    }
+
+    .page-header {
+      padding: 50px 4%;
+      text-align: center;
+      background: var(--light-green);
+    }
+
+    .page-header h1 {
+      margin: 0 0 8px;
+      color: var(--dark-green);
+      font-size: clamp(30px, 4vw, 44px);
+    }
+
+    .page-header p {
+      margin: 0;
+      color: var(--muted);
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 22px;
+    }
+
+    .card {
+      background: var(--white);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 24px;
+      box-shadow: 0 5px 18px rgba(0, 0, 0, 0.03);
+    }
+
+    .card h3 {
+      margin-top: 0;
+      color: var(--dark-green);
+    }
+
+    .form-wrap {
+      max-width: 650px;
+      margin: 42px auto;
+      padding: 30px;
+      background: var(--white);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+    }
+
+    .form-wrap h1,
+    .form-wrap h2 {
+      color: var(--dark-green);
+    }
+
+    .field {
+      margin-bottom: 18px;
+    }
+
+    .field label {
+      display: block;
+      margin-bottom: 6px;
+      font-weight: 700;
+    }
+
+    .field input,
+    .field textarea,
+    .field select {
+      width: 100%;
+      padding: 12px;
+      border: 1px solid #bdcbc0;
+      border-radius: 6px;
+      font: inherit;
+      background: var(--white);
+    }
+
+    .field textarea {
+      min-height: 130px;
+      resize: vertical;
+    }
+
+    .notice {
+      max-width: 1000px;
+      width: 92%;
+      margin: 20px auto 0;
+      padding: 12px 16px;
+      background: var(--light-green);
+      border-left: 4px solid var(--green);
+      border-radius: 4px;
+      overflow-wrap: anywhere;
+    }
+
+    .dashboard-card {
+      background: var(--white);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 24px;
+      margin-bottom: 20px;
+    }
+
+    .dashboard-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin-top: 20px;
+    }
+
+    .muted {
+      color: var(--muted);
+    }
+
+    footer {
+      background: #102d1d;
+      color: var(--white);
+      padding: 35px 0;
+      margin-top: 40px;
+    }
+
+    footer a {
+      color: #d9f3e1;
+    }
+
+    .footer-grid {
+      display: grid;
+      grid-template-columns: 2fr 1fr;
+      gap: 25px;
+    }
+
+    .small {
+      font-size: 14px;
+    }
+
+    @media (max-width: 850px) {
+      .menu-toggle {
+        display: inline-block;
       }
+
+      .navbar {
+        flex-wrap: wrap;
+        padding: 14px 0;
+      }
+
+      .nav-links {
+        display: none;
+        width: 100%;
+        align-items: flex-start;
+        flex-direction: column;
+        padding: 12px 0;
+      }
+
+      .nav-links.open {
+        display: flex;
+      }
+
+      .grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+    }
+
+    @media (max-width: 560px) {
+      .grid,
+      .footer-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .hero {
+        padding: 60px 0;
+      }
+
+      .form-wrap {
+        width: 92%;
+        padding: 22px;
+      }
+    }
+  </style>
+</head>
+
+<body>
+  <header>
+    <div class="container navbar">
+      <a class="brand" href="/">Youth Justice Initiative Kenya</a>
+
+      <button
+        id="menuToggle"
+        class="menu-toggle"
+        type="button"
+        aria-expanded="false"
+        aria-controls="navLinks"
+      >Menu ☰</button>
+
+      <nav id="navLinks" class="nav-links" aria-label="Main navigation">
+        <a href="/">Home</a>
+        <a href="/about">About</a>
+        <a href="/programmes">Programmes</a>
+        <a href="/contact">Contact</a>
+        <a href="/donate">Support Us</a>
+        ${nav}
+      </nav>
+    </div>
+  </header>
+
+  ${notice}
+
+  <main>
+    ${content}
+  </main>
+
+  <footer>
+    <div class="container footer-grid">
+      <div>
+        <h3>Youth Justice Initiative Kenya</h3>
+        <p>
+          Promoting youth rights, legal awareness, access to justice,
+          community safety and youth empowerment.
+        </p>
+      </div>
+
+      <div>
+        <h3>Quick Links</h3>
+        <p><a href="/about">About Us</a></p>
+        <p><a href="/programmes">Our Programmes</a></p>
+        <p><a href="/contact">Contact Us</a></p>
+        <p><a href="/privacy">Privacy Policy</a></p>
+      </div>
+    </div>
+
+    <div class="container small">
+      <p>
+        &copy; ${new Date().getFullYear()} Youth Justice Initiative Kenya.
+        All rights reserved.
+      </p>
+    </div>
+  </footer>
+
+  <script>
+    const menuToggle = document.getElementById("menuToggle");
+    const navLinks = document.getElementById("navLinks");
+
+    if (menuToggle && navLinks) {
+      menuToggle.addEventListener("click", function () {
+        const isOpen = navLinks.classList.toggle("open");
+        menuToggle.setAttribute("aria-expanded", String(isOpen));
+      });
+    }
+  </script>
+</body>
+</html>`;
+}
+
+function formPage(req, title, description, fields, submitLabel) {
+  return renderPage(
+    req,
+    title,
+    `
+      ${pageHeader(title, description)}
+
+      <section class="form-wrap">
+        <form method="POST">
+          ${fields}
+          <button class="button" type="submit">${escapeHTML(submitLabel)}</button>
+        </form>
+      </section>
+    `
+  );
+}
+
+function sendEmail(options) {
+  if (!transporter) {
+    return Promise.resolve(false);
+  }
+
+  return transporter.sendMail(options).then(
+    () => true,
+    error => {
+      console.error("Email delivery failed:", error.message);
+      return false;
+    }
+  );
+}
+
+/* =========================================================
+   HEALTH CHECK
+========================================================= */
+
+app.get("/health", (req, res) => {
+  try {
+    db.prepare("SELECT 1").get();
+
+    res.status(200).json({
+      status: "ok",
+      service: "Youth Justice Initiative Kenya",
+      database: "connected",
+      timestamp: new Date().toISOString()
     });
-  });
+  } catch (error) {
+    console.error("Health check failed:", error.message);
 
-  const password = document.getElementById("password");
-  const confirmPassword = document.getElementById("confirmPassword");
-
-  if (password && confirmPassword) {
-    confirmPassword.addEventListener("input", () => {
-      confirmPassword.setCustomValidity(
-        confirmPassword.value === password.value
-          ? ""
-          : "Passwords do not match."
-      );
-    });
-
-    password.addEventListener("input", () => {
-      confirmPassword.setCustomValidity(
-        !confirmPassword.value ||
-        confirmPassword.value === password.value
-          ? ""
-          : "Passwords do not match."
-      );
+    res.status(500).json({
+      status: "error",
+      database: "unavailable"
     });
   }
-</script></body>
-</html>`;
-}function pageHeader(title, description) {
-return "<section class="page-header"> <h1>${escapeHTML(title)}</h1> <p>${escapeHTML(description)}</p> </section>";
-}
+});
 
-function formPage(title, description, fields, buttonText, action) {
-return `
-<section class="form-wrap">
-<h1>${escapeHTML(title)}</h1>
-<p>${escapeHTML(description)}</p>
-
-  <form method="POST" action="${action}" data-validate>
-    ${fields}
-
-    <button class="button full" type="submit">
-      ${escapeHTML(buttonText)}
-    </button>
-  </form>
-</section>
-
-`;
-}
-
-function sendPage(res, title, content, req, status = 200) {
-res.status(status).send(renderPage(title, content, req));
-}
-
-// --------------------------------------------------
-// HOME
-// --------------------------------------------------
+/* =========================================================
+   HOME PAGE
+========================================================= */
 
 app.get("/", (req, res) => {
-const content = `
-<section class="hero">
-<div class="hero-inner">
-<div>
-<span class="eyebrow">
-Rights • Justice • Empowerment
-</span>
+  const content = `
+    <section class="hero">
+      <div class="container">
+        <h1>Justice, Dignity and Opportunity for Every Young Person</h1>
 
-      <h1>
-        Empowering Young People.
-        Advancing Justice.
-        Building Safer Communities.
-      </h1>
+        <p>
+          Youth Justice Initiative Kenya works to promote youth rights,
+          legal awareness, access to justice, community safety and
+          opportunities for young people.
+        </p>
 
-      <p>
-        Youth Justice Initiative Kenya is a community-oriented
-        initiative focused on youth rights awareness, access to
-        justice, legal awareness, community safety and opportunities
-        that help young people participate meaningfully in society.
-      </p>
-
-      <div class="hero-actions">
-        <a class="button lime" href="/about">Discover Our Mission</a>
-        <a class="button light" href="/signup">Join Our Community</a>
+        <a class="button" href="/about">Learn About Us</a>
+        <a class="button button-secondary" href="/signup">Join Our Community</a>
       </div>
-    </div>
+    </section>
 
-    <div class="hero-box">
-      <h3>Our Commitment</h3>
-      <ul>
-        <li>Promoting youth rights and responsibilities.</li>
-        <li>Encouraging fairness and accountability.</li>
-        <li>Sharing information about opportunities.</li>
-        <li>Supporting peaceful, safer communities.</li>
-        <li>Strengthening youth participation.</li>
-      </ul>
-    </div>
-  </div>
-</section>
+    <section class="section">
+      <div class="container">
+        <h2>Who We Are</h2>
 
-<section class="section">
-  <div class="section-heading">
-    <span class="eyebrow">Our Focus</span>
-    <h2>Justice, dignity and opportunity for every young person</h2>
+        <p class="section-intro">
+          We seek to empower young people with knowledge of their rights,
+          information about justice processes, and connections to
+          constructive opportunities within their communities.
+        </p>
 
-    <p>
-      We aim to bridge information gaps and encourage young people
-      to understand their rights, find appropriate support and
-      participate in positive community development.
-    </p>
-  </div>
+        <div class="grid">
+          <article class="card">
+            <h3>Youth Rights</h3>
+            <p>
+              Promote awareness of the rights, responsibilities and
+              protections available to young people.
+            </p>
+          </article>
 
-  <div class="grid">
-    <article class="card">
-      <div class="icon">⚖️</div>
-      <h3>Youth Rights</h3>
-      <p>
-        Promote awareness of constitutional rights, equality,
-        responsibilities and fair treatment.
-      </p>
-    </article>
+          <article class="card">
+            <h3>Access to Justice</h3>
+            <p>
+              Share legal information and help young people identify
+              appropriate channels for seeking assistance.
+            </p>
+          </article>
 
-    <article class="card">
-      <div class="icon">🤝</div>
-      <h3>Access to Justice</h3>
-      <p>
-        Help young people understand complaint channels and
-        identify appropriate legal or public support services.
-      </p>
-    </article>
+          <article class="card">
+            <h3>Youth Empowerment</h3>
+            <p>
+              Connect young people with relevant educational,
+              livelihood and community development opportunities.
+            </p>
+          </article>
+        </div>
+      </div>
+    </section>
 
-    <article class="card">
-      <div class="icon">🌱</div>
-      <h3>Youth Empowerment</h3>
-      <p>
-        Share information about employment, education, training
-        and entrepreneurship opportunities.
-      </p>
-    </article>
-  </div>
-</section>
+    <section class="section" style="background:#eaf5ee">
+      <div class="container">
+        <h2>Be Part of the Change</h2>
 
-<section class="section white">
-  <div class="section-heading">
-    <span class="eyebrow">What We Aim to Do</span>
-    <h2>Turning awareness into positive community action</h2>
-  </div>
+        <p>
+          Join our community, share an idea, volunteer your skills
+          or discuss a potential partnership.
+        </p>
 
-  <div class="grid two">
-    <article class="card">
-      <h3>Legal Awareness</h3>
-      <p>
-        Encourage informed discussions about rights, responsibilities,
-        legal procedures and available assistance.
-      </p>
-    </article>
+        <a class="button" href="/signup">Become a Member</a>
+        <a class="button button-secondary" href="/contact">Contact Us</a>
+      </div>
+    </section>
+  `;
 
-    <article class="card">
-      <h3>Community Safety</h3>
-      <p>
-        Promote peaceful conflict resolution, violence prevention
-        awareness and constructive community engagement.
-      </p>
-    </article>
-
-    <article class="card">
-      <h3>Partnerships</h3>
-      <p>
-        Explore cooperation with civil society organisations,
-        humanitarian actors, educators and relevant institutions.
-      </p>
-    </article>
-
-    <article class="card">
-      <h3>Youth Participation</h3>
-      <p>
-        Encourage youth voices in public participation, leadership
-        and community decision-making.
-      </p>
-    </article>
-  </div>
-</section>
-
-<section class="section green-section">
-  <div class="section-heading">
-    <span class="eyebrow">Our Values</span>
-    <h2>Principles that guide our work</h2>
-  </div>
-
-  <div class="grid">
-    <article class="card">
-      <h3>Integrity</h3>
-      <p>Honesty, accountability and responsible leadership.</p>
-    </article>
-
-    <article class="card">
-      <h3>Human Dignity</h3>
-      <p>Respect, fairness and non-discrimination.</p>
-    </article>
-
-    <article class="card">
-      <h3>Inclusion</h3>
-      <p>Meaningful participation and respect for diverse voices.</p>
-    </article>
-  </div>
-</section>
-
-<section class="section cta">
-  <h2>Be part of positive change</h2>
-  <p>
-    Whether you are a young person, volunteer, professional,
-    organisation or potential donor, we welcome enquiries about
-    working together towards our shared objectives.
-  </p>
-  <a class="button" href="/contact">Contact Us</a>
-  <a class="button" href="/donate">Support Our Work</a>
-</section>
-
-`;
-
-sendPage(res, "Home", content, req);
+  res.send(renderPage(req, "Home", content));
 });
 
-// --------------------------------------------------
-// ABOUT
-// --------------------------------------------------
+/* =========================================================
+   ABOUT PAGE
+========================================================= */
 
 app.get("/about", (req, res) => {
-const content = `
-${pageHeader(
-"About Us",
-"Our mission, vision, objectives and commitment to young people."
-)}
+  const content = `
+    ${pageHeader(
+      "About Us",
+      "Promoting youth rights, justice, safety and empowerment."
+    )}
 
-<section class="section">
-  <div class="content">
-    <h2>Who We Are</h2>
+    <section class="section">
+      <div class="container">
+        <h2>Our Purpose</h2>
 
-    <p>
-      Youth Justice Initiative Kenya is a youth-focused initiative
-      concerned with human rights awareness, access to justice,
-      legal awareness, community safety and youth empowerment.
-    </p>
+        <p>
+          Youth Justice Initiative Kenya is a community-oriented initiative
+          focused on youth rights awareness, legal awareness, fair treatment
+          within the justice system and access to appropriate support.
+        </p>
 
-    <p>
-      With a community presence in Lurende Market, Khatiri,
-      Bungoma County, Kenya, the initiative seeks to encourage
-      informed, peaceful and constructive participation by young
-      people in matters affecting their lives and communities.
-    </p>
+        <h2>Our Vision</h2>
 
-    <h2>Our Mission</h2>
+        <p>
+          A society where young people understand their rights, access
+          justice fairly and participate meaningfully in community life.
+        </p>
 
-    <p>
-      To promote youth rights, access to justice, legal awareness
-      and empowerment through community education, partnerships,
-      advocacy and responsible engagement.
-    </p>
+        <h2>Our Mission</h2>
 
-    <h2>Our Vision</h2>
+        <p>
+          To promote youth rights, legal awareness, access to justice,
+          community safety and youth empowerment through education,
+          outreach, collaboration and advocacy.
+        </p>
 
-    <p>
-      A just, inclusive and peaceful society where young people
-      understand their rights, access appropriate support and
-      participate meaningfully in community development.
-    </p>
+        <h2>Our Values</h2>
 
-    <h2>Our Objectives</h2>
+        <div class="grid">
+          <article class="card">
+            <h3>Dignity</h3>
+            <p>Respect for every person's dignity and rights.</p>
+          </article>
 
-    <ul>
-      <li>Promote awareness of constitutional rights and freedoms.</li>
-      <li>Improve understanding of appropriate justice mechanisms.</li>
-      <li>Encourage access to reliable legal information.</li>
-      <li>Share information about education and employment opportunities.</li>
-      <li>Promote peaceful coexistence and conflict prevention.</li>
-      <li>Encourage youth participation in public decision-making.</li>
-      <li>Build partnerships that strengthen youth development.</li>
-    </ul>
+          <article class="card">
+            <h3>Accountability</h3>
+            <p>Responsible conduct, transparency and ethical practice.</p>
+          </article>
 
-    <h2>Our Principles</h2>
+          <article class="card">
+            <h3>Inclusion</h3>
+            <p>Meaningful participation of young people in community affairs.</p>
+          </article>
+        </div>
+      </div>
+    </section>
+  `;
 
-    <p>
-      Our approach is guided by integrity, human dignity,
-      accountability, inclusion, non-discrimination, peaceful
-      engagement and respect for the law.
-    </p>
-
-    <h2>Our Community</h2>
-
-    <p>
-      Our community presence is in Lurende Market, Khatiri,
-      Bungoma County. Programme delivery and expansion depend
-      on organisational capacity, resources and partnerships.
-    </p>
-
-    <p>
-      Programme descriptions on this website identify intended
-      areas of work. They do not imply that every programme is
-      currently funded or operating.
-    </p>
-  </div>
-</section>
-
-`;
-
-sendPage(res, "About Us", content, req);
+  res.send(renderPage(req, "About Us", content));
 });
 
-// --------------------------------------------------
-// PROGRAMMES
-// --------------------------------------------------
+/* =========================================================
+   PROGRAMMES PAGE
+========================================================= */
 
 app.get("/programmes", (req, res) => {
-const programmes = [
-[
-"Youth Rights Awareness",
-"Educational activities about constitutional rights, equality, freedom of expression, non-discrimination and responsible citizenship."
-],
-[
-"Access to Justice",
-"Information about appropriate complaint channels, legal aid resources and referrals to qualified service providers."
-],
-[
-"Community Safety",
-"Awareness of peaceful conflict resolution, violence prevention, responsible citizenship and community wellbeing."
-],
-[
-"Youth Empowerment",
-"Sharing information about employment, scholarships, education, entrepreneurship and training opportunities."
-],
-[
-"Youth Participation",
-"Encouraging young people to contribute to public participation, leadership, community dialogue and policy discussions."
-],
-[
-"Partnerships",
-"Exploring collaboration with civil society organisations, humanitarian actors, educators, legal professionals and public institutions."
-]
-];
+  const programmes = [
+    [
+      "Youth Rights Awareness",
+      "Community education on human rights, constitutional rights and the responsibilities of young people."
+    ],
+    [
+      "Legal Awareness and Access to Justice",
+      "General legal information and referrals to qualified advocates, legal aid providers and appropriate authorities."
+    ],
+    [
+      "Community Safety",
+      "Constructive engagement with communities and relevant stakeholders to promote safety, prevention and peaceful conflict resolution."
+    ],
+    [
+      "Child Protection and Youth Welfare",
+      "Awareness of child protection, safeguarding and appropriate reporting or referral channels."
+    ],
+    [
+      "Youth Empowerment",
+      "Sharing information about education, employment, skills development and other opportunities."
+    ],
+    [
+      "Advocacy and Youth Participation",
+      "Encouraging young people to participate in decision-making and community development."
+    ]
+  ];
 
-const cards = programmes.map(item => "<article class="card"> <h3>${escapeHTML(item[0])}</h3> <p>${escapeHTML(item[1])}</p> </article>").join("");
+  const cards = programmes
+    .map(
+      item => `
+        <article class="card">
+          <h3>${escapeHTML(item[0])}</h3>
+          <p>${escapeHTML(item[1])}</p>
+        </article>
+      `
+    )
+    .join("");
 
-sendPage(
-res,
-"Our Programmes",
-`
-${pageHeader(
-"Our Programmes",
-"Our intended programme areas in youth rights, justice and empowerment."
-)}
+  const content = `
+    ${pageHeader(
+      "Our Programmes",
+      "Building knowledge, opportunity and safer communities."
+    )}
 
-  <section class="section">
-    <div class="grid">${cards}</div>
-  </section>
-
-  <section class="section cta">
-    <h2>Interested in collaboration?</h2>
-    <p>
-      Contact us to discuss potential programme partnerships,
-      volunteering or support for community activities.
-    </p>
-    <a class="button" href="/contact">Discuss a Partnership</a>
-  </section>
-`,
-req
-
-);
-});
-
-// --------------------------------------------------
-// SIGN UP
-// --------------------------------------------------
-
-app.get("/signup", (req, res) => {
-const fields = `
-<div class="field">
-<label for="name">Full name</label>
-<input id="name" name="name" minlength="2"
-maxlength="100" autocomplete="name" required>
-</div>
-
-<div class="field">
-  <label for="email">Email address</label>
-  <input id="email" name="email" type="email"
-    maxlength="254" autocomplete="email" required>
-</div>
-
-<div class="field">
-  <label for="password">Password</label>
-  <input id="password" name="password" type="password"
-    minlength="12" maxlength="72"
-    autocomplete="new-password" required>
-  <p class="help">Use at least 12 characters.</p>
-</div>
-
-<div class="field">
-  <label for="confirmPassword">Confirm password</label>
-  <input id="confirmPassword" name="confirmPassword"
-    type="password" minlength="12" maxlength="72"
-    autocomplete="new-password" required>
-</div>
-
-<div class="field">
-  <label>
-    <input type="checkbox" name="agree" value="yes" required>
-    I have read the <a href="/privacy">privacy information</a>.
-  </label>
-</div>
-
-`;
-
-sendPage(
-res,
-"Sign Up",
-formPage(
-"Create Your Account",
-"Join the Youth Justice Initiative Kenya online community.",
-fields,
-"Create Account",
-"/signup"
-),
-req
-);
-});
-
-app.post("/signup", authLimiter, async (req, res, next) => {
-try {
-const name = String(req.body.name || "").trim();
-const email = emailNormal(req.body.email);
-const password = req.body.password;
-
-if (name.length < 2 || name.length > 100 ||
-    !validEmail(email) ||
-    !validPassword(password) ||
-    password !== req.body.confirmPassword ||
-    req.body.agree !== "yes") {
-  return flashRedirect(
-    res,
-    "/signup",
-    "Check your details, password and privacy acknowledgement."
-  );
-}
-
-const existing = await get(
-  "SELECT id FROM users WHERE email = ?",
-  [email]
-);
-
-if (existing) {
-  return flashRedirect(
-    res,
-    "/signup",
-    "An account could not be created with those details."
-  );
-}
-
-const passwordHash = await bcrypt.hash(password, 12);
-
-const result = await run(
-  "INSERT INTO users (name, email, password_hash) VALUES (?, ?, ?)",
-  [name, email, passwordHash]
-);
-
-await regenerateSession(req);
-
-req.session.user = {
-  id: result.id,
-  name,
-  email
-};
-
-await saveSession(req);
-
-res.redirect("/dashboard");
-
-} catch (error) {
-if (error.code === "SQLITE_CONSTRAINT") {
-return flashRedirect(
-res,
-"/signup",
-"Unable to create the account. Please try again."
-);
-}
-
-next(error);
-
-}
-});
-
-// --------------------------------------------------
-// LOGIN
-// --------------------------------------------------
-
-app.get("/login", (req, res) => {
-const fields = `
-<div class="field">
-<label for="email">Email address</label>
-<input id="email" name="email" type="email"
-maxlength="254" autocomplete="username" required>
-</div>
-
-<div class="field">
-  <label for="password">Password</label>
-  <input id="password" name="password" type="password"
-    maxlength="72" autocomplete="current-password" required>
-</div>
-
-<p><a href="/forgot-password">Forgot your password?</a></p>
-<p>New user? <a href="/signup">Create an account</a>.</p>
-
-`;
-
-sendPage(
-res,
-"Login",
-formPage(
-"Welcome Back",
-"Log in to your YJIK account.",
-fields,
-"Login",
-"/login"
-),
-req
-);
-});
-
-app.post("/login", authLimiter, async (req, res, next) => {
-try {
-const email = emailNormal(req.body.email);
-const password = req.body.password;
-
-if (!validEmail(email) ||
-    typeof password !== "string" ||
-    Buffer.byteLength(password, "utf8") > 72) {
-  return flashRedirect(
-    res,
-    "/login",
-    "Invalid email or password."
-  );
-}
-
-const user = await get(
-  "SELECT id, name, email, password_hash FROM users WHERE email = ?",
-  [email]
-);
-
-const matches = user
-  ? await bcrypt.compare(password, user.password_hash)
-  : false;
-
-if (!matches) {
-  return flashRedirect(
-    res,
-    "/login",
-    "Invalid email or password."
-  );
-}
-
-await regenerateSession(req);
-
-req.session.user = {
-  id: user.id,
-  name: user.name,
-  email: user.email
-};
-
-await saveSession(req);
-
-res.redirect("/dashboard");
-
-} catch (error) {
-next(error);
-}
-});
-
-// --------------------------------------------------
-// GREEN MEMBER DASHBOARD
-// --------------------------------------------------
-
-app.get("/dashboard", requireLogin, async (req, res, next) => {
-try {
-const user = req.session.user;
-
-const content = `
-  <section class="dashboard-shell">
-    <div class="dashboard">
-
-      <aside class="sidebar">
-        <h3>YJIK MEMBER PORTAL</h3>
-
-        <a class="active" href="/dashboard">▦ Dashboard</a>
-        <a href="/about">♧ About YJIK</a>
-        <a href="/programmes">◎ Programmes</a>
-        <a href="/contact">✉ Contact Us</a>
-        <a href="/donate">♡ Support Our Work</a>
-        <a href="/privacy">▤ Privacy</a>
-
-        <a href="/logout">↪ Logout</a>
-      </aside>
-
-      <div class="dash-main">
-        <div class="dash-heading">
-          <span class="eyebrow">MEMBER PORTAL</span>
-
-          <h1>
-            Welcome, ${escapeHTML(user.name)}!
-          </h1>
-
-          <p>
-            Welcome to your Youth Justice Initiative Kenya
-            member dashboard.
-          </p>
+    <section class="section">
+      <div class="container">
+        <div class="grid">
+          ${cards}
         </div>
-
-        <div class="stat-grid">
-          <div class="stat-card">
-            <strong>YJIK</strong>
-            <span>Your community initiative</span>
-          </div>
-
-          <div class="stat-card">
-            <strong>Rights</strong>
-            <span>Awareness and access to justice</span>
-          </div>
-
-          <div class="stat-card">
-            <strong>Growth</strong>
-            <span>Learning and empowerment</span>
-          </div>
-        </div>
-
-        <section class="dash-panel">
-          <h2>Your Account</h2>
-
-          <p>
-            <strong>Full name:</strong>
-            ${escapeHTML(user.name)}
-          </p>
-
-          <p>
-            <strong>Email:</strong>
-            ${escapeHTML(user.email)}
-          </p>
-
-          <p>
-            <strong>Account ID:</strong>
-            ${Number(user.id)}
-          </p>
-
-          <p>
-            Your account allows you to access this member portal.
-            It does not automatically confer organisational
-            membership, an official position, or authority to
-            represent the initiative.
-          </p>
-        </section>
-
-        <section class="dash-panel">
-          <h2>Explore Youth Justice Initiative Kenya</h2>
-
-          <div class="action-grid">
-            <div class="action-card">
-              <h3>Youth Rights</h3>
-              <p>
-                Learn about our rights-awareness objectives
-                and approach.
-              </p>
-              <a href="/about">Learn more →</a>
-            </div>
-
-            <div class="action-card">
-              <h3>Our Programmes</h3>
-              <p>
-                Explore our intended work in justice,
-                community safety and empowerment.
-              </p>
-              <a href="/programmes">Explore programmes →</a>
-            </div>
-
-            <div class="action-card">
-              <h3>Contact the Initiative</h3>
-              <p>
-                Send an enquiry about volunteering,
-                collaboration or our work.
-              </p>
-              <a href="/contact">Contact us →</a>
-            </div>
-
-            <div class="action-card">
-              <h3>Support Our Work</h3>
-              <p>
-                Submit a donation pledge to indicate
-                your intended contribution.
-              </p>
-              <a href="/donate">Support YJIK →</a>
-            </div>
-          </div>
-        </section>
-
-        <section class="dash-panel">
-          <h2>Our Commitment</h2>
-
-          <p>
-            We aim to encourage dignity, fairness,
-            accountability, inclusion and meaningful
-            youth participation.
-          </p>
-
-          <form method="POST" action="/logout">
-            <button class="button" type="submit">Log Out</button>
-          </form>
-        </section>
       </div>
+    </section>
+  `;
+
+  res.send(renderPage(req, "Programmes", content));
+});
+
+/* =========================================================
+   CONTACT PAGE
+========================================================= */
+
+app.get("/contact", (req, res) => {
+  const fields = `
+    <div class="field">
+      <label for="name">Full name</label>
+      <input id="name" name="name" type="text" maxlength="100" required>
     </div>
-  </section>
-`;
 
-sendPage(res, "Member Dashboard", content, req);
+    <div class="field">
+      <label for="email">Email address</label>
+      <input id="email" name="email" type="email" maxlength="254" required>
+    </div>
 
-} catch (error) {
-next(error);
-}
+    <div class="field">
+      <label for="subject">Subject</label>
+      <input id="subject" name="subject" type="text" maxlength="150" required>
+    </div>
+
+    <div class="field">
+      <label for="message">Message</label>
+      <textarea id="message" name="message" maxlength="5000" required></textarea>
+    </div>
+  `;
+
+  res.send(
+    formPage(
+      req,
+      "Contact Us",
+      "Send us a question, suggestion or partnership enquiry.",
+      fields,
+      "Send Message"
+    )
+  );
 });
 
-// --------------------------------------------------
-// LOGOUT
-// --------------------------------------------------
+app.post("/contact", (req, res) => {
+  const name = String(req.body.name || "").trim();
+  const email = String(req.body.email || "").trim().toLowerCase();
+  const subject = String(req.body.subject || "").trim();
+  const message = String(req.body.message || "").trim();
 
-app.get("/logout", (req, res) => {
-res.redirect("/dashboard");
-});
-
-app.post("/logout", async (req, res, next) => {
-try {
-await destroySession(req);
-
-res.clearCookie("yjik.sid", {
-  path: "/",
-  httpOnly: true,
-  secure: PRODUCTION,
-  sameSite: "lax"
-});
-
-res.redirect("/");
-
-} catch (error) {
-next(error);
-}
-});
-
-// --------------------------------------------------
-// FORGOT PASSWORD
-// --------------------------------------------------
-
-app.get("/forgot-password", (req, res) => {
-const fields = "<div class="field"> <label for="email">Email address</label> <input id="email" name="email" type="email" maxlength="254" autocomplete="email" required> </div>";
-
-sendPage(
-res,
-"Forgot Password",
-formPage(
-"Forgot Your Password?",
-"Enter your email address to request a password reset.",
-fields,
-"Send Reset Instructions",
-"/forgot-password"
-),
-req
-);
-});
-
-app.post(
-"/forgot-password",
-formLimiter,
-async (req, res, next) => {
-try {
-const email = emailNormal(req.body.email);
-
-  const genericMessage =
-    "If an account exists for that email, reset instructions will be sent.";
-
-  if (!validEmail(email)) {
-    return flashRedirect(
+  if (
+    !name ||
+    !validEmail(email) ||
+    !subject ||
+    !message ||
+    name.length > 100 ||
+    email.length > 254 ||
+    subject.length > 150 ||
+    message.length > 5000
+  ) {
+    return redirectMessage(
       res,
-      "/forgot-password",
-      genericMessage
+      "/contact",
+      "Please provide valid details in all fields."
     );
   }
 
-  const user = await get(
-    "SELECT id, name, email FROM users WHERE email = ?",
-    [email]
-  );
+  try {
+    db.prepare(`
+      INSERT INTO contact_messages (name, email, subject, message)
+      VALUES (?, ?, ?, ?)
+    `).run(name, email, subject, message);
 
-  if (user) {
-    await run(
-      "DELETE FROM password_resets WHERE user_id = ?",
-      [user.id]
+    console.log("New contact message received.");
+
+    return redirectMessage(
+      res,
+      "/contact",
+      "Thank you. Your message has been received."
     );
+  } catch (error) {
+    console.error("Contact message database error:", error.message);
 
-    const token = crypto.randomBytes(32).toString("hex");
+    return redirectMessage(
+      res,
+      "/contact",
+      "We could not save your message. Please try again later."
+    );
+  }
+});
 
+/* =========================================================
+   DONATION / SUPPORT PAGE
+   This records pledges only. It does not process payments.
+========================================================= */
+
+app.get("/donate", (req, res) => {
+  const fields = `
+    <div class="field">
+      <label for="name">Full name</label>
+      <input id="name" name="name" type="text" maxlength="100" required>
+    </div>
+
+    <div class="field">
+      <label for="email">Email address</label>
+      <input id="email" name="email" type="email" maxlength="254" required>
+    </div>
+
+    <div class="field">
+      <label for="amount">Pledge amount (KES)</label>
+      <input id="amount" name="amount" type="number" min="1" max="100000000" step="1" required>
+    </div>
+
+    <div class="field">
+      <label for="message">Message (optional)</label>
+      <textarea id="message" name="message" maxlength="1000"></textarea>
+    </div>
+  `;
+
+  const content = `
+    ${pageHeader(
+      "Support Our Work",
+      "Help support youth rights awareness, access to justice and empowerment."
+    )}
+
+    <section class="form-wrap">
+      <h2>Make a Pledge</h2>
+
+      <p class="muted">
+        This form records an expression of support. It does not collect
+        payment details or transfer money. Payment arrangements must be
+        confirmed separately through an authorized channel.
+      </p>
+
+      <form method="POST">
+        ${fields}
+        <button class="button" type="submit">Submit Pledge</button>
+      </form>
+    </section>
+  `;
+
+  res.send(renderPage(req, "Support Us", content));
+});
+
+app.post("/donate", (req, res) => {
+  const name = String(req.body.name || "").trim();
+  const email = String(req.body.email || "").trim().toLowerCase();
+  const amount = Number(req.body.amount);
+  const message = String(req.body.message || "").trim();
+
+  if (
+    !name ||
+    name.length > 100 ||
+    !validEmail(email) ||
+    email.length > 254 ||
+    !Number.isFinite(amount) ||
+    amount < 1 ||
+    amount > 100000000 ||
+    !Number.isInteger(amount) ||
+    message.length > 1000
+  ) {
+    return redirectMessage(
+      res,
+      "/donate",
+      "Please provide valid pledge details."
+    );
+  }
+
+  try {
+    db.prepare(`
+      INSERT INTO donation_pledges (name, email, amount, message)
+      VALUES (?, ?, ?, ?)
+    `).run(name, email, amount, message);
+
+    console.log("A new support pledge was recorded.");
+
+    return redirectMessage(
+      res,
+      "/donate",
+      "Thank you for your support pledge. This form has not processed a payment."
+    );
+  } catch (error) {
+    console.error("Pledge database error:", error.message);
+
+    return redirectMessage(
+      res,
+      "/donate",
+      "We could not record your pledge. Please try again."
+    );
+  }
+});
+
+/* =========================================================
+   SIGNUP
+========================================================= */
+
+app.get("/signup", (req, res) => {
+  if (currentUser(req)) {
+    return res.redirect("/dashboard");
+  }
+
+  const fields = `
+    <div class="field">
+      <label for="name">Full name</label>
+      <input
+        id="name"
+        name="name"
+        type="text"
+        maxlength="100"
+        autocomplete="name"
+        required
+      >
+    </div>
+
+    <div class="field">
+      <label for="email">Email address</label>
+      <input
+        id="email"
+        name="email"
+        type="email"
+        maxlength="254"
+        autocomplete="email"
+        required
+      >
+    </div>
+
+    <div class="field">
+      <label for="password">Password</label>
+      <input
+        id="password"
+        name="password"
+        type="password"
+        minlength="8"
+        maxlength="128"
+        autocomplete="new-password"
+        required
+      >
+      <small>Use at least 8 characters.</small>
+    </div>
+  `;
+
+  res.send(
+    formPage(
+      req,
+      "Create an Account",
+      "Join the Youth Justice Initiative Kenya online community.",
+      fields,
+      "Create Account"
+    )
+  );
+});
+
+app.post("/signup", async (req, res) => {
+  const name = String(req.body.name || "").trim();
+  const email = String(req.body.email || "").trim().toLowerCase();
+  const password = String(req.body.password || "");
+
+  if (
+    !name ||
+    name.length > 100 ||
+    !validEmail(email) ||
+    email.length > 254 ||
+    password.length < 8 ||
+    password.length > 128
+  ) {
+    return redirectMessage(
+      res,
+      "/signup",
+      "Enter a valid name and email, and use a password of at least 8 characters."
+    );
+  }
+
+  try {
+    const existingUser = db
+      .prepare("SELECT id FROM users WHERE email = ?")
+      .get(email);
+
+    if (existingUser) {
+      return redirectMessage(
+        res,
+        "/signup",
+        "An account with that email already exists. Please log in."
+      );
+    }
+
+    const passwordHash = await bcrypt.hash(password, 12);
+
+    const result = db.prepare(`
+      INSERT INTO users (name, email, password_hash)
+      VALUES (?, ?, ?)
+    `).run(name, email, passwordHash);
+
+    req.session.regenerate(error => {
+      if (error) {
+        console.error("Session regeneration error:", error.message);
+
+        return redirectMessage(
+          res,
+          "/login",
+          "Your account was created. Please log in."
+        );
+      }
+
+      req.session.userId = Number(result.lastInsertRowid);
+
+      req.session.save(saveError => {
+        if (saveError) {
+          console.error("Session save error:", saveError.message);
+
+          return redirectMessage(
+            res,
+            "/login",
+            "Your account was created. Please log in."
+          );
+        }
+
+        res.redirect("/dashboard");
+      });
+    });
+  } catch (error) {
+    console.error("Signup error:", error.message);
+
+    return redirectMessage(
+      res,
+      "/signup",
+      "We could not create your account. Please try again."
+    );
+  }
+});
+
+/* =========================================================
+   LOGIN
+========================================================= */
+
+app.get("/login", (req, res) => {
+  if (currentUser(req)) {
+    return res.redirect("/dashboard");
+  }
+
+  const fields = `
+    <div class="field">
+      <label for="email">Email address</label>
+      <input
+        id="email"
+        name="email"
+        type="email"
+        maxlength="254"
+        autocomplete="email"
+        required
+      >
+    </div>
+
+    <div class="field">
+      <label for="password">Password</label>
+      <input
+        id="password"
+        name="password"
+        type="password"
+        maxlength="128"
+        autocomplete="current-password"
+        required
+      >
+    </div>
+
+    <p><a href="/forgot-password">Forgot your password?</a></p>
+    <p>New here? <a href="/signup">Create an account</a>.</p>
+  `;
+
+  res.send(
+    formPage(
+      req,
+      "Login",
+      "Log in to access your member dashboard.",
+      fields,
+      "Login"
+    )
+  );
+});
+
+app.post("/login", async (req, res) => {
+  const email = String(req.body.email || "").trim().toLowerCase();
+  const password = String(req.body.password || "");
+
+  if (!validEmail(email) || password.length > 128 || !password) {
+    return redirectMessage(
+      res,
+      "/login",
+      "Invalid email or password."
+    );
+  }
+
+  try {
+    const user = db
+      .prepare("SELECT id, password_hash FROM users WHERE email = ?")
+      .get(email);
+
+    const passwordMatches =
+      user && (await bcrypt.compare(password, user.password_hash));
+
+    if (!passwordMatches) {
+      return redirectMessage(
+        res,
+        "/login",
+        "Invalid email or password."
+      );
+    }
+
+    req.session.regenerate(error => {
+      if (error) {
+        console.error("Login session error:", error.message);
+
+        return redirectMessage(
+          res,
+          "/login",
+          "Login failed. Please try again."
+        );
+      }
+
+      req.session.userId = user.id;
+
+      req.session.save(saveError => {
+        if (saveError) {
+          console.error("Login session save error:", saveError.message);
+
+          return redirectMessage(
+            res,
+            "/login",
+            "Login failed. Please try again."
+          );
+        }
+
+        res.redirect("/dashboard");
+      });
+    });
+  } catch (error) {
+    console.error("Login error:", error.message);
+
+    return redirectMessage(
+      res,
+      "/login",
+      "We could not log you in. Please try again."
+    );
+  }
+});
+
+/* =========================================================
+   MEMBER DASHBOARD
+========================================================= */
+
+app.get("/dashboard", requireLogin, (req, res) => {
+  const user = currentUser(req);
+
+  if (!user) {
+    return res.redirect("/login");
+  }
+
+  const content = `
+    ${pageHeader(
+      "Member Dashboard",
+      "Welcome to your Youth Justice Initiative Kenya account."
+    )}
+
+    <section class="section">
+      <div class="container">
+        <div class="dashboard-card">
+          <h2>Welcome, ${escapeHTML(user.name)}!</h2>
+
+          <p>
+            You are logged in to the Youth Justice Initiative Kenya
+            member area.
+          </p>
+
+          <p><strong>Name:</strong> ${escapeHTML(user.name)}</p>
+          <p><strong>Email:</strong> ${escapeHTML(user.email)}</p>
+          <p>
+            <strong>Member since:</strong>
+            ${escapeHTML(user.created_at)}
+          </p>
+        </div>
+
+        <div class="dashboard-card">
+          <h2>Get Involved</h2>
+
+          <p>
+            Explore our programmes, contact the initiative or share
+            information about opportunities and potential partnerships.
+          </p>
+
+          <div class="dashboard-actions">
+            <a class="button" href="/programmes">Explore Programmes</a>
+            <a class="button" href="/contact">Contact Us</a>
+            <a class="button button-secondary" href="/privacy">Privacy Policy</a>
+          </div>
+        </div>
+      </div>
+    </section>
+  `;
+
+  res.send(renderPage(req, "Member Dashboard", content));
+});
+
+/* =========================================================
+   LOGOUT
+========================================================= */
+
+app.post("/logout", (req, res) => {
+  req.session.destroy(error => {
+    if (error) {
+      console.error("Logout error:", error.message);
+    }
+
+    res.clearCookie("yjik.sid");
+    res.redirect("/");
+  });
+});
+
+/* =========================================================
+   FORGOT PASSWORD
+========================================================= */
+
+app.get("/forgot-password", (req, res) => {
+  const fields = `
+    <div class="field">
+      <label for="email">Email address</label>
+      <input
+        id="email"
+        name="email"
+        type="email"
+        maxlength="254"
+        autocomplete="email"
+        required
+      >
+    </div>
+  `;
+
+  res.send(
+    formPage(
+      req,
+      "Forgot Password",
+      "Request a password reset link for your account.",
+      fields,
+      "Request Reset Link"
+    )
+  );
+});
+
+app.post("/forgot-password", async (req, res) => {
+  const email = String(req.body.email || "").trim().toLowerCase();
+
+  if (!validEmail(email) || email.length > 254) {
+    return redirectMessage(
+      res,
+      "/forgot-password",
+      "If an account exists for that email, password reset instructions will be sent."
+    );
+  }
+
+  try {
+    const user = db
+      .prepare("SELECT id, name, email FROM users WHERE email = ?")
+      .get(email);
+
+    if (user) {
+      const rawToken = crypto.randomBytes(32).toString("hex");
+      const tokenHash = crypto
+        .createHash("sha256")
+        .update(rawToken)
+        .digest("hex");
+
+      const expiresAt = Date.now() + 30 * 60 * 1000;
+
+      db.prepare(`
+        UPDATE password_resets
+        SET used = 1
+        WHERE user_id = ? AND used = 0
+      `).run(user.id);
+
+      db.prepare(`
+        INSERT INTO password_resets (user_id, token_hash, expires_at)
+        VALUES (?, ?, ?)
+      `).run(user.id, tokenHash, expiresAt);
+
+      const resetURL =
+        `${publicURL(req)}/reset-password/${encodeURIComponent(rawToken)}`;
+
+      const emailSent = await sendEmail({
+        from: process.env.SMTP_FROM || process.env.SMTP_USER,
+        to: user.email,
+        subject: "Password Reset - Youth Justice Initiative Kenya",
+        text:
+          `Hello ${user.name},\n\n` +
+          `A password reset was requested for your account.\n\n` +
+          `Open this link within 30 minutes:\n${resetURL}\n\n` +
+          `If you did not request this, you can ignore this email.`
+      });
+
+      if (!emailSent) {
+        console.warn(
+          "Password reset email could not be sent. Configure SMTP settings."
+        );
+      }
+    }
+  } catch (error) {
+    console.error("Forgot-password error:", error.message);
+  }
+
+  return redirectMessage(
+    res,
+    "/forgot-password",
+    "If an account exists for that email, password reset instructions will be sent."
+  );
+});
+
+/* =========================================================
+   RESET PASSWORD
+========================================================= */
+
+app.get("/reset-password/:token", (req, res) => {
+  const token = String(req.params.token || "");
+
+  if (!/^[a-f0-9]{64}$/i.test(token)) {
+    return res.status(400).send(
+      renderPage(
+        req,
+        "Invalid Reset Link",
+        `
+          <section class="form-wrap">
+            <h1>Invalid Reset Link</h1>
+            <p>This password reset link is invalid.</p>
+            <a class="button" href="/forgot-password">Request Another Link</a>
+          </section>
+        `
+      )
+    );
+  }
+
+  const tokenHash = crypto
+    .createHash("sha256")
+    .update(token)
+    .digest("hex");
+
+  const reset = db.prepare(`
+    SELECT id
+    FROM password_resets
+    WHERE token_hash = ?
+      AND used = 0
+      AND expires_at > ?
+  `).get(tokenHash, Date.now());
+
+  if (!reset) {
+    return res.status(400).send(
+      renderPage(
+        req,
+        "Expired Reset Link",
+        `
+          <section class="form-wrap">
+            <h1>Expired or Invalid Link</h1>
+            <p>This reset link is no longer valid.</p>
+            <a class="button" href="/forgot-password">Request Another Link</a>
+          </section>
+        `
+      )
+    );
+  }
+
+  const fields = `
+    <input type="hidden" name="token" value="${escapeHTML(token)}">
+
+    <div class="field">
+      <label for="password">New password</label>
+      <input
+        id="password"
+        name="password"
+        type="password"
+        minlength="8"
+        maxlength="128"
+        autocomplete="new-password"
+        required
+      >
+    </div>
+
+    <div class="field">
+      <label for="confirmPassword">Confirm new password</label>
+      <input
+        id="confirmPassword"
+        name="confirmPassword"
+        type="password"
+        minlength="8"
+        maxlength="128"
+        autocomplete="new-password"
+        required
+      >
+    </div>
+  `;
+
+  res.send(
+    formPage(
+      req,
+      "Reset Password",
+      "Choose a new password for your account.",
+      fields,
+      "Update Password"
+    )
+  );
+});
+
+app.post("/reset-password/:token", async (req, res) => {
+  const token = String(req.params.token || "");
+  const password = String(req.body.password || "");
+  const confirmPassword = String(req.body.confirmPassword || "");
+
+  if (
+    !/^[a-f0-9]{64}$/i.test(token) ||
+    password.length < 8 ||
+    password.length > 128 ||
+    password !== confirmPassword
+  ) {
+    return redirectMessage(
+      res,
+      "/forgot-password",
+      "The reset request was invalid. Request a new reset link and try again."
+    );
+  }
+
+  try {
     const tokenHash = crypto
       .createHash("sha256")
       .update(token)
       .digest("hex");
 
-    const expires = Date.now() + 15 * 60 * 1000;
+    const reset = db.prepare(`
+      SELECT id, user_id
+      FROM password_resets
+      WHERE token_hash = ?
+        AND used = 0
+        AND expires_at > ?
+    `).get(tokenHash, Date.now());
 
-    await run(
-      `INSERT INTO password_resets
-       (user_id, token_hash, expires_at)
-       VALUES (?, ?, ?)`,
-      [user.id, tokenHash, expires]
-    );
-
-    const link = publicURL(
-      req,
-      "/reset-password?token=" + token
-    );
-
-    try {
-      await sendEmail({
-        to: user.email,
-        subject: "Reset your YJIK password",
-
-        text:
-          "Hello " + user.name + ",\n\n" +
-          "Use this link within 15 minutes to reset your password:\n" +
-          link + "\n\n" +
-          "If you did not request this, ignore this email.",
-
-        html:
-          `<p>Hello ${escapeHTML(user.name)},</p>` +
-          `<p>Use the link below within 15 minutes.</p>` +
-          `<p><a href="${escapeHTML(link)}">Reset password</a></p>` +
-          `<p>If you did not request this, ignore this email.</p>`
-      });
-    } catch (mailError) {
-      console.error(
-        "Password reset email failed:",
-        mailError.message
+    if (!reset) {
+      return redirectMessage(
+        res,
+        "/forgot-password",
+        "This reset link is invalid or expired. Request another one."
       );
     }
-  }
 
-  flashRedirect(res, "/forgot-password", genericMessage);
-} catch (error) {
-  next(error);
-}
+    const passwordHash = await bcrypt.hash(password, 12);
 
-}
-);
+    const updatePassword = db.transaction(() => {
+      db.prepare(`
+        UPDATE users
+        SET password_hash = ?
+        WHERE id = ?
+      `).run(passwordHash, reset.user_id);
 
-// --------------------------------------------------
-// RESET PASSWORD
-// --------------------------------------------------
+      db.prepare(`
+        UPDATE password_resets
+        SET used = 1
+        WHERE id = ?
+      `).run(reset.id);
 
-app.get("/reset-password", async (req, res, next) => {
-try {
-const token = String(req.query.token || "");
-
-if (!/^[a-f0-9]{64}$/.test(token)) {
-  return sendPage(
-    res,
-    "Reset Password",
-    `
-      <section class="form-wrap">
-        <h1>Invalid Reset Link</h1>
-        <p>Request a new password-reset link.</p>
-        <a class="button" href="/forgot-password">Try Again</a>
-      </section>
-    `,
-    req,
-    400
-  );
-}
-
-const hash = crypto
-  .createHash("sha256")
-  .update(token)
-  .digest("hex");
-
-const record = await get(
-  `SELECT id FROM password_resets
-   WHERE token_hash = ? AND expires_at > ?`,
-  [hash, Date.now()]
-);
-
-if (!record) {
-  return sendPage(
-    res,
-    "Reset Password",
-    `
-      <section class="form-wrap">
-        <h1>Reset Link Expired</h1>
-        <p>Request a new password-reset link.</p>
-        <a class="button" href="/forgot-password">Request New Link</a>
-      </section>
-    `,
-    req,
-    400
-  );
-}
-
-const fields = `
-  <input type="hidden" name="token"
-    value="${escapeHTML(token)}">
-
-  <div class="field">
-    <label for="password">New password</label>
-    <input id="password" name="password" type="password"
-      minlength="12" maxlength="72"
-      autocomplete="new-password" required>
-  </div>
-
-  <div class="field">
-    <label for="confirmPassword">Confirm password</label>
-    <input id="confirmPassword" name="confirmPassword"
-      type="password" minlength="12" maxlength="72"
-      autocomplete="new-password" required>
-  </div>
-`;
-
-res.set("Referrer-Policy", "no-referrer");
-
-sendPage(
-  res,
-  "Reset Password",
-  formPage(
-    "Choose a New Password",
-    "Your password reset link expires after 15 minutes.",
-    fields,
-    "Update Password",
-    "/reset-password"
-  ),
-  req
-);
-
-} catch (error) {
-next(error);
-}
-});
-
-app.post(
-"/reset-password",
-formLimiter,
-async (req, res, next) => {
-try {
-const token = String(req.body.token || "");
-const password = req.body.password;
-
-  if (!/^[a-f0-9]{64}$/.test(token) ||
-      !validPassword(password) ||
-      password !== req.body.confirmPassword) {
-    return res.status(400).send(
-      "Invalid token or password. Request a new reset link if needed."
-    );
-  }
-
-  const hash = crypto
-    .createHash("sha256")
-    .update(token)
-    .digest("hex");
-
-  const record = await get(
-    `SELECT id, user_id FROM password_resets
-     WHERE token_hash = ? AND expires_at > ?`,
-    [hash, Date.now()]
-  );
-
-  if (!record) {
-    return res.status(400).send(
-      "The password reset link is invalid or expired."
-    );
-  }
-
-  const passwordHash = await bcrypt.hash(password, 12);
-
-  await run(
-    "UPDATE users SET password_hash = ? WHERE id = ?",
-    [passwordHash, record.user_id]
-  );
-
-  await run(
-    "DELETE FROM password_resets WHERE user_id = ?",
-    [record.user_id]
-  );
-
-  flashRedirect(
-    res,
-    "/login",
-    "Password updated. Please log in with your new password."
-  );
-} catch (error) {
-  next(error);
-}
-
-}
-);
-
-// --------------------------------------------------
-// CONTACT
-// --------------------------------------------------
-
-app.get("/contact", (req, res) => {
-const fields = `
-<div class="field">
-<label for="name">Full name</label>
-<input id="name" name="name" maxlength="100" required>
-</div>
-
-<div class="field">
-  <label for="email">Email address</label>
-  <input id="email" name="email" type="email"
-    maxlength="254" required>
-</div>
-
-<div class="field">
-  <label for="subject">Subject</label>
-  <input id="subject" name="subject"
-    maxlength="150" required>
-</div>
-
-<div class="field">
-  <label for="message">Message</label>
-  <textarea id="message" name="message"
-    minlength="10" maxlength="5000" required></textarea>
-</div>
-
-`;
-
-const content = `
-${pageHeader(
-"Contact Us",
-"Enquiries about our work, partnerships, volunteering and support."
-)}
-
-<section class="section">
-  <div class="grid two">
-    <article class="card">
-      <h2>Get in Touch</h2>
-
-      <p>
-        We welcome enquiries from young people, community members,
-        civil society organisations, volunteers and potential partners.
-      </p>
-
-      <p>
-        <strong>Community location</strong><br>
-        Lurende Market, Khatiri, Bungoma County, Kenya.
-      </p>
-
-      <p>
-        <strong>Email</strong><br>
-        ${
-          process.env.CONTACT_EMAIL
-            ? `<a href="mailto:${escapeHTML(process.env.CONTACT_EMAIL)}">${
-                escapeHTML(process.env.CONTACT_EMAIL)
-              }</a>`
-            : "Contact email has not yet been configured."
-        }
-      </p>
-
-      <p>
-        Do not submit passwords, confidential legal documents or
-        sensitive information through this general contact form.
-      </p>
-    </article>
-
-    <div>
-      ${formPage(
-        "Send a Message",
-        "Complete the form below.",
-        fields,
-        "Send Message",
-        "/contact"
-      )}
-    </div>
-  </div>
-</section>
-
-`;
-
-sendPage(res, "Contact Us", content, req);
-});
-
-app.post("/contact", formLimiter, async (req, res, next) => {
-try {
-const name = String(req.body.name || "").trim();
-const email = emailNormal(req.body.email);
-const subject = String(req.body.subject || "").trim();
-const message = String(req.body.message || "").trim();
-
-if (name.length < 2 || name.length > 100 ||
-    !validEmail(email) ||
-    subject.length < 2 || subject.length > 150 ||
-    message.length < 10 || message.length > 5000) {
-  return res.status(400).send(
-    "Please check your contact details and try again."
-  );
-}
-
-await run(
-  `INSERT INTO contact_messages
-   (name, email, subject, message)
-   VALUES (?, ?, ?, ?)`,
-  [name, email, subject, message]
-);
-
-if (process.env.CONTACT_EMAIL) {
-  try {
-    await sendEmail({
-      to: process.env.CONTACT_EMAIL,
-      subject: "YJIK enquiry: " + subject,
-
-      text:
-        "Name: " + name + "\n" +
-        "Email: " + email + "\n\n" +
-        message
+      db.prepare(`
+        UPDATE password_resets
+        SET used = 1
+        WHERE user_id = ?
+      `).run(reset.user_id);
     });
+
+    updatePassword();
+
+    return redirectMessage(
+      res,
+      "/login",
+      "Your password has been updated. You can now log in."
+    );
   } catch (error) {
-    console.error("Contact notification failed:", error.message);
+    console.error("Reset-password error:", error.message);
+
+    return redirectMessage(
+      res,
+      "/forgot-password",
+      "We could not reset your password. Please request another reset link."
+    );
   }
-}
-
-flashRedirect(
-  res,
-  "/contact",
-  "Thank you. Your message has been recorded."
-);
-
-} catch (error) {
-next(error);
-}
 });
 
-// --------------------------------------------------
-// DONATIONS
-// --------------------------------------------------
-
-app.get("/donate", (req, res) => {
-const fields = `
-<div class="field">
-<label for="name">Full name</label>
-<input id="name" name="name" maxlength="100" required>
-</div>
-
-<div class="field">
-  <label for="email">Email address</label>
-  <input id="email" name="email" type="email"
-    maxlength="254" required>
-</div>
-
-<div class="field">
-  <label for="amount">Pledge amount (KES)</label>
-  <input id="amount" name="amount" type="number"
-    min="1" max="10000000" step="1" required>
-</div>
-
-<div class="field">
-  <label for="programme">Programme</label>
-  <select id="programme" name="programme" required>
-    <option value="">Select a programme</option>
-    <option>Youth Rights Awareness</option>
-    <option>Access to Justice</option>
-    <option>Community Safety</option>
-    <option>Youth Empowerment</option>
-    <option>General Support</option>
-  </select>
-</div>
-
-<div class="field">
-  <label for="message">Message (optional)</label>
-  <textarea id="message" name="message" maxlength="1000"></textarea>
-</div>
-
-`;
-
-const content = `
-${pageHeader(
-"Support Our Work",
-"Support our intended work in youth rights, justice and empowerment."
-)}
-
-<section class="section">
-  <div class="grid two">
-    <article class="card">
-      <h2>How Support Can Help</h2>
-
-      <p>
-        Financial support may help the initiative develop educational
-        materials, conduct outreach, share information about
-        opportunities and strengthen partnerships.
-      </p>
-
-      <ul>
-        <li>Youth rights education.</li>
-        <li>Community awareness activities.</li>
-        <li>Legal information and referral awareness.</li>
-        <li>Youth empowerment activities.</li>
-        <li>Responsible programme administration.</li>
-      </ul>
-
-      <p>
-        Contributions should be handled through verified channels,
-        with proper records and transparent reporting.
-      </p>
-    </article>
-
-    <div>
-      ${formPage(
-        "Make a Donation Pledge",
-        "Indicate the amount you intend to contribute.",
-        fields,
-        "Submit Pledge",
-        "/donate"
-      )}
-
-      <p class="help">
-        This form records a pledge only. It does not charge your
-        account or process M-Pesa, bank or card payments.
-      </p>
-    </div>
-  </div>
-</section>
-
-`;
-
-sendPage(res, "Donate", content, req);
-});
-
-app.post("/donate", formLimiter, async (req, res, next) => {
-try {
-const name = String(req.body.name || "").trim();
-const email = emailNormal(req.body.email);
-const amount = Number(req.body.amount);
-const programme = String(req.body.programme || "");
-const message = String(req.body.message || "").trim();
-
-const allowed = [
-  "Youth Rights Awareness",
-  "Access to Justice",
-  "Community Safety",
-  "Youth Empowerment",
-  "General Support"
-];
-
-if (name.length < 2 || name.length > 100 ||
-    !validEmail(email) ||
-    !Number.isSafeInteger(amount) ||
-    amount < 1 || amount > 10000000 ||
-    !allowed.includes(programme) ||
-    message.length > 1000) {
-  return res.status(400).send(
-    "Please check your donation pledge details."
-  );
-}
-
-await run(
-  `INSERT INTO donations
-   (name, email, amount, programme, message, status)
-   VALUES (?, ?, ?, ?, ?, 'pledged')`,
-  [name, email, amount, programme, message]
-);
-
-sendPage(
-  res,
-  "Pledge Received",
-  `
-    <section class="form-wrap">
-      <h1>Thank You for Your Support!</h1>
-
-      <p>
-        Your pledge of KES
-        ${amount.toLocaleString("en-KE")}
-        for ${escapeHTML(programme)} has been recorded.
-      </p>
-
-      <p>
-        This is a pledge, not a completed payment.
-        No money has been collected through this form.
-      </p>
-
-      <a class="button" href="/">Return Home</a>
-    </section>
-  `,
-  req
-);
-
-} catch (error) {
-next(error);
-}
-});
-
-// --------------------------------------------------
-// PRIVACY
-// --------------------------------------------------
+/* =========================================================
+   PRIVACY POLICY
+========================================================= */
 
 app.get("/privacy", (req, res) => {
-const content = `
-${pageHeader(
-"Privacy Information",
-"Information about how this website handles user data."
-)}
+  const content = `
+    ${pageHeader(
+      "Privacy Policy",
+      "How this website handles personal information."
+    )}
 
-<section class="section">
-  <div class="content">
-    <h2>Information Collected</h2>
+    <section class="section">
+      <div class="container">
+        <h2>Information We Collect</h2>
 
-    <p>
-      Depending on how you use the website, it may collect your
-      name, email address, password hash, contact enquiry and
-      donation pledge details.
-    </p>
+        <p>
+          Depending on how you use this website, information may include
+          your name, email address, account details, messages and support
+          pledges you voluntarily submit.
+        </p>
 
-    <h2>Purpose</h2>
+        <h2>How Information Is Used</h2>
 
-    <p>
-      Information may be used to manage accounts, answer enquiries,
-      deliver password resets and record donation pledges.
-    </p>
+        <p>
+          Information may be used to manage accounts, respond to enquiries,
+          record support pledges, maintain website security and communicate
+          about requests you make.
+        </p>
 
-    <h2>Security</h2>
+        <h2>Security and Access</h2>
 
-    <p>
-      Passwords are hashed before storage. Access to personal data
-      should be restricted to authorised persons.
-    </p>
+        <p>
+          We take reasonable steps to protect information. No website or
+          electronic storage system can be guaranteed completely secure.
+          Access to stored information should be restricted to authorized
+          people who need it for legitimate purposes.
+        </p>
 
-    <h2>Data Protection</h2>
+        <h2>Sharing Information</h2>
 
-    <p>
-      Personal information must be handled in accordance with
-      applicable Kenyan data protection law. Before launch,
-      complete this notice with the organisation's actual data
-      controller details, retention policy, lawful processing
-      purposes, rights procedures and any third-party services.
-    </p>
+        <p>
+          Personal information should not be sold. Information may need
+          to be disclosed where required by law or to address legitimate
+          security and operational requirements.
+        </p>
 
-    <h2>Contact</h2>
+        <h2>Your Choices</h2>
 
-    <p>
-      For privacy questions, contact the organisation through
-      the contact details published on this website.
-    </p>
-  </div>
-</section>
+        <p>
+          For questions or requests concerning information submitted
+          through this website, please contact us through the
+          <a href="/contact">contact page</a>.
+        </p>
 
-`;
+        <p class="muted">
+          This is a general website privacy notice and should be reviewed
+          against the initiative's actual practices and applicable Kenyan
+          data protection requirements before publication.
+        </p>
+      </div>
+    </section>
+  `;
 
-sendPage(res, "Privacy Information", content, req);
+  res.send(renderPage(req, "Privacy Policy", content));
 });
 
-// --------------------------------------------------
-// HEALTH CHECK
-// --------------------------------------------------
-
-app.get("/health", async (req, res) => {
-try {
-await get("SELECT 1 AS ok");
-
-res.json({
-  status: "ok",
-  application: "Youth Justice Initiative Kenya",
-  database: "connected",
-  timestamp: new Date().toISOString()
-});
-
-} catch (error) {
-res.status(503).json({
-status: "error",
-database: "unavailable"
-});
-}
-});
-
-// --------------------------------------------------
-// 404
-// --------------------------------------------------
+/* =========================================================
+   404 PAGE
+========================================================= */
 
 app.use((req, res) => {
-sendPage(
-res,
-"Page Not Found",
-"<section class="form-wrap"> <h1>404 - Page Not Found</h1> <p>The requested page could not be found.</p> <a class="button" href="/">Return Home</a> </section>",
-req,
-404
-);
-});
-
-// --------------------------------------------------
-// ERROR HANDLER
-// --------------------------------------------------
-
-app.use((error, req, res, next) => {
-console.error("Application error:", error.message);
-
-if (res.headersSent) return next(error);
-
-sendPage(
-res,
-"Server Error",
-"<section class="form-wrap"> <h1>Something Went Wrong</h1> <p>Please try again later.</p> <a class="button" href="/">Return Home</a> </section>",
-req,
-500
-);
-});
-
-// --------------------------------------------------
-// START
-// --------------------------------------------------
-
-async function start() {
-try {
-await initialiseDatabase();
-
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(
-    "Youth Justice Initiative Kenya running on port " + PORT
+  res.status(404).send(
+    renderPage(
+      req,
+      "Page Not Found",
+      `
+        <section class="form-wrap">
+          <h1>404 - Page Not Found</h1>
+          <p>The requested page could not be found.</p>
+          <a class="button" href="/">Return Home</a>
+        </section>
+      `
+    )
   );
 });
 
-} catch (error) {
-console.error("Startup failed:", error);
-process.exit(1);
-}
+/* =========================================================
+   ERROR HANDLER
+========================================================= */
+
+app.use((error, req, res, next) => {
+  console.error("Application error:", error.message);
+
+  if (res.headersSent) {
+    return next(error);
+  }
+
+  res.status(500).send(
+    renderPage(
+      req,
+      "Server Error",
+      `
+        <section class="form-wrap">
+          <h1>Something Went Wrong</h1>
+          <p>Please try again later.</p>
+          <a class="button" href="/">Return Home</a>
+        </section>
+      `
+    )
+  );
+});
+
+/* =========================================================
+   START SERVER
+========================================================= */
+
+const server = app.listen(PORT, "0.0.0.0", () => {
+  console.log(`Youth Justice Initiative Kenya server listening on port ${PORT}`);
+  console.log(`Environment: ${NODE_ENV}`);
+  console.log(`Database: ${path.join(DATA_DIR, "yjik.sqlite")}`);
+});
+
+function shutDown(signal) {
+  console.log(`${signal} received. Closing server...`);
+
+  server.close(() => {
+    try {
+      db.close();
+      console.log("Database connection closed.");
+      process.exit(0);
+    } catch (error) {
+      console.error("Shutdown error:", error.message);
+      process.exit(1);
+    }
+  });
+
+  setTimeout(() => process.exit(1), 10000).unref();
 }
 
-start();
+process.on("SIGTERM", () => shutDown("SIGTERM"));
+process.on("SIGINT", () => shutDown("SIGINT"));
