@@ -77,6 +77,12 @@ db.exec(`
    SECURITY AND MIDDLEWARE
 ========================================================= */
 
+// Trust Render's HTTPS reverse proxy.
+// This must be set before session middleware.
+if (process.env.NODE_ENV === "production") {
+  app.set("trust proxy", 1);
+}
+
 app.disable("x-powered-by");
 
 app.use(
