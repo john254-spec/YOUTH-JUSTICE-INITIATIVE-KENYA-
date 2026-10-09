@@ -19,8 +19,12 @@ const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "data");
 const SESSION_SECRET =
   process.env.SESSION_SECRET || "development-only-change-this-secret";
 
+const DONATION_PHONE = "0743544461";
+
 if (NODE_ENV === "production" && SESSION_SECRET.length < 32) {
-  throw new Error("SESSION_SECRET must contain at least 32 characters in production.");
+  throw new Error(
+    "SESSION_SECRET must contain at least 32 characters in production."
+  );
 }
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -77,9 +81,9 @@ db.exec(`
    SECURITY AND MIDDLEWARE
 ========================================================= */
 
-// Trust Render's HTTPS reverse proxy.
-// This must be set before session middleware.
-if (process.env.NODE_ENV === "production") {
+// Render runs behind a reverse proxy.
+// Trust the proxy so HTTPS session cookies work correctly.
+if (NODE_ENV === "production") {
   app.set("trust proxy", 1);
 }
 
@@ -137,7 +141,11 @@ app.use(
 
 let transporter = null;
 
-if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
+if (
+  process.env.SMTP_HOST &&
+  process.env.SMTP_USER &&
+  process.env.SMTP_PASS
+) {
   transporter = nodemailer.createTransport({
     host: process.env.SMTP_HOST,
     port: Number(process.env.SMTP_PORT || 587),
@@ -169,6 +177,10 @@ function validEmail(value) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
 }
 
+function normalizeEmail(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
 function publicURL(req) {
   if (process.env.BASE_URL) {
     return process.env.BASE_URL.replace(/\/+$/, "");
@@ -178,28 +190,33 @@ function publicURL(req) {
 }
 
 function currentUser(req) {
-  if (!req.session.userId) {
+  if (!req.session || !req.session.userId) {
     return null;
   }
 
   return (
     db
-      .prepare("SELECT id, name, email, created_at FROM users WHERE id = ?")
+      .prepare(
+        "SELECT id, name, email, created_at FROM users WHERE id = ?"
+      )
       .get(req.session.userId) || null
   );
 }
 
 function requireLogin(req, res, next) {
   if (!req.session.userId || !currentUser(req)) {
-    return res.redirect("/login?message=" + encodeURIComponent("Please log in first."));
+    return res.redirect(
+      "/login?message=" +
+        encodeURIComponent("Please log in to access your dashboard.")
+    );
   }
 
   next();
 }
 
-function redirectMessage(res, pathName, message) {
+function redirectMessage(res, route, message) {
   return res.redirect(
-    `${pathName}?message=${encodeURIComponent(message)}`
+    `${route}?message=${encodeURIComponent(message)}`
   );
 }
 
@@ -228,7 +245,9 @@ function renderPage(req, title, content) {
     `;
 
   const notice = req.query.message
-    ? `<div class="notice" role="status">${escapeHTML(req.query.message)}</div>`
+    ? `<div class="notice" role="status">${escapeHTML(
+        req.query.message
+      )}</div>`
     : "";
 
   return `<!DOCTYPE html>
@@ -250,16 +269,11 @@ function renderPage(req, title, content) {
       --border: #dce5de;
       --background: #f7faf8;
       --white: #ffffff;
-      --danger: #a61b1b;
     }
 
-    * {
-      box-sizing: border-box;
-    }
+    * { box-sizing: border-box; }
 
-    html {
-      scroll-behavior: smooth;
-    }
+    html { scroll-behavior: smooth; }
 
     body {
       margin: 0;
@@ -269,9 +283,7 @@ function renderPage(req, title, content) {
       background: var(--background);
     }
 
-    a {
-      color: var(--green);
-    }
+    a { color: var(--green); }
 
     .container {
       width: min(1120px, 92%);
@@ -327,10 +339,7 @@ function renderPage(req, title, content) {
       cursor: pointer;
     }
 
-    .logout-form {
-      display: inline;
-      margin: 0;
-    }
+    .logout-form { display: inline; margin: 0; }
 
     .menu-toggle {
       display: none;
@@ -341,9 +350,7 @@ function renderPage(req, title, content) {
       cursor: pointer;
     }
 
-    main {
-      min-height: 70vh;
-    }
+    main { min-height: 70vh; }
 
     .hero {
       padding: 90px 0;
@@ -388,9 +395,7 @@ function renderPage(req, title, content) {
       border: 1px solid var(--green);
     }
 
-    .section {
-      padding: 55px 0;
-    }
+    .section { padding: 55px 0; }
 
     .section h2 {
       color: var(--dark-green);
@@ -448,13 +453,9 @@ function renderPage(req, title, content) {
     }
 
     .form-wrap h1,
-    .form-wrap h2 {
-      color: var(--dark-green);
-    }
+    .form-wrap h2 { color: var(--dark-green); }
 
-    .field {
-      margin-bottom: 18px;
-    }
+    .field { margin-bottom: 18px; }
 
     .field label {
       display: block;
@@ -504,8 +505,22 @@ function renderPage(req, title, content) {
       margin-top: 20px;
     }
 
-    .muted {
-      color: var(--muted);
+    .muted { color: var(--muted); }
+
+    .donation-box {
+      border: 2px solid var(--green);
+      background: var(--light-green);
+      border-radius: 10px;
+      padding: 22px;
+      margin: 20px 0;
+    }
+
+    .phone-number {
+      font-size: clamp(25px, 5vw, 34px);
+      font-weight: 800;
+      color: var(--dark-green);
+      letter-spacing: 1px;
+      overflow-wrap: anywhere;
     }
 
     footer {
@@ -515,9 +530,7 @@ function renderPage(req, title, content) {
       margin-top: 40px;
     }
 
-    footer a {
-      color: #d9f3e1;
-    }
+    footer a { color: #d9f3e1; }
 
     .footer-grid {
       display: grid;
@@ -525,14 +538,10 @@ function renderPage(req, title, content) {
       gap: 25px;
     }
 
-    .small {
-      font-size: 14px;
-    }
+    .small { font-size: 14px; }
 
     @media (max-width: 850px) {
-      .menu-toggle {
-        display: inline-block;
-      }
+      .menu-toggle { display: inline-block; }
 
       .navbar {
         flex-wrap: wrap;
@@ -547,24 +556,14 @@ function renderPage(req, title, content) {
         padding: 12px 0;
       }
 
-      .nav-links.open {
-        display: flex;
-      }
+      .nav-links.open { display: flex; }
 
-      .grid {
-        grid-template-columns: repeat(2, minmax(0, 1fr));
-      }
+      .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     }
 
     @media (max-width: 560px) {
-      .grid,
-      .footer-grid {
-        grid-template-columns: 1fr;
-      }
-
-      .hero {
-        padding: 60px 0;
-      }
+      .grid, .footer-grid { grid-template-columns: 1fr; }
+      .hero { padding: 60px 0; }
 
       .form-wrap {
         width: 92%;
@@ -592,7 +591,7 @@ function renderPage(req, title, content) {
         <a href="/about">About</a>
         <a href="/programmes">Programmes</a>
         <a href="/contact">Contact</a>
-        <a href="/donate">Support Us</a>
+        <a href="/donate">Donate</a>
         ${nav}
       </nav>
     </div>
@@ -600,9 +599,7 @@ function renderPage(req, title, content) {
 
   ${notice}
 
-  <main>
-    ${content}
-  </main>
+  <main>${content}</main>
 
   <footer>
     <div class="container footer-grid">
@@ -619,6 +616,7 @@ function renderPage(req, title, content) {
         <p><a href="/about">About Us</a></p>
         <p><a href="/programmes">Our Programmes</a></p>
         <p><a href="/contact">Contact Us</a></p>
+        <p><a href="/donate">Donate</a></p>
         <p><a href="/privacy">Privacy Policy</a></p>
       </div>
     </div>
@@ -652,11 +650,12 @@ function formPage(req, title, description, fields, submitLabel) {
     title,
     `
       ${pageHeader(title, description)}
-
       <section class="form-wrap">
         <form method="POST">
           ${fields}
-          <button class="button" type="submit">${escapeHTML(submitLabel)}</button>
+          <button class="button" type="submit">${escapeHTML(
+            submitLabel
+          )}</button>
         </form>
       </section>
     `
@@ -710,22 +709,20 @@ app.get("/", (req, res) => {
     <section class="hero">
       <div class="container">
         <h1>Justice, Dignity and Opportunity for Every Young Person</h1>
-
         <p>
           Youth Justice Initiative Kenya works to promote youth rights,
           legal awareness, access to justice, community safety and
           opportunities for young people.
         </p>
-
         <a class="button" href="/about">Learn About Us</a>
         <a class="button button-secondary" href="/signup">Join Our Community</a>
+        <a class="button button-secondary" href="/donate">Support Our Work</a>
       </div>
     </section>
 
     <section class="section">
       <div class="container">
         <h2>Who We Are</h2>
-
         <p class="section-intro">
           We seek to empower young people with knowledge of their rights,
           information about justice processes, and connections to
@@ -735,26 +732,17 @@ app.get("/", (req, res) => {
         <div class="grid">
           <article class="card">
             <h3>Youth Rights</h3>
-            <p>
-              Promote awareness of the rights, responsibilities and
-              protections available to young people.
-            </p>
+            <p>Promote awareness of the rights and protections available to young people.</p>
           </article>
 
           <article class="card">
             <h3>Access to Justice</h3>
-            <p>
-              Share legal information and help young people identify
-              appropriate channels for seeking assistance.
-            </p>
+            <p>Share legal information and help young people identify appropriate channels for assistance.</p>
           </article>
 
           <article class="card">
             <h3>Youth Empowerment</h3>
-            <p>
-              Connect young people with relevant educational,
-              livelihood and community development opportunities.
-            </p>
+            <p>Connect young people with educational, livelihood and community opportunities.</p>
           </article>
         </div>
       </div>
@@ -763,12 +751,7 @@ app.get("/", (req, res) => {
     <section class="section" style="background:#eaf5ee">
       <div class="container">
         <h2>Be Part of the Change</h2>
-
-        <p>
-          Join our community, share an idea, volunteer your skills
-          or discuss a potential partnership.
-        </p>
-
+        <p>Join our community, volunteer your skills or discuss a potential partnership.</p>
         <a class="button" href="/signup">Become a Member</a>
         <a class="button button-secondary" href="/contact">Contact Us</a>
       </div>
@@ -792,7 +775,6 @@ app.get("/about", (req, res) => {
     <section class="section">
       <div class="container">
         <h2>Our Purpose</h2>
-
         <p>
           Youth Justice Initiative Kenya is a community-oriented initiative
           focused on youth rights awareness, legal awareness, fair treatment
@@ -800,14 +782,12 @@ app.get("/about", (req, res) => {
         </p>
 
         <h2>Our Vision</h2>
-
         <p>
           A society where young people understand their rights, access
           justice fairly and participate meaningfully in community life.
         </p>
 
         <h2>Our Mission</h2>
-
         <p>
           To promote youth rights, legal awareness, access to justice,
           community safety and youth empowerment through education,
@@ -815,18 +795,15 @@ app.get("/about", (req, res) => {
         </p>
 
         <h2>Our Values</h2>
-
         <div class="grid">
           <article class="card">
             <h3>Dignity</h3>
             <p>Respect for every person's dignity and rights.</p>
           </article>
-
           <article class="card">
             <h3>Accountability</h3>
             <p>Responsible conduct, transparency and ethical practice.</p>
           </article>
-
           <article class="card">
             <h3>Inclusion</h3>
             <p>Meaningful participation of young people in community affairs.</p>
@@ -840,7 +817,7 @@ app.get("/about", (req, res) => {
 });
 
 /* =========================================================
-   PROGRAMMES PAGE
+   PROGRAMMES
 ========================================================= */
 
 app.get("/programmes", (req, res) => {
@@ -855,7 +832,7 @@ app.get("/programmes", (req, res) => {
     ],
     [
       "Community Safety",
-      "Constructive engagement with communities and relevant stakeholders to promote safety, prevention and peaceful conflict resolution."
+      "Constructive engagement with communities and relevant stakeholders to promote safety and peaceful conflict resolution."
     ],
     [
       "Child Protection and Youth Welfare",
@@ -882,26 +859,25 @@ app.get("/programmes", (req, res) => {
     )
     .join("");
 
-  const content = `
-    ${pageHeader(
-      "Our Programmes",
-      "Building knowledge, opportunity and safer communities."
-    )}
-
-    <section class="section">
-      <div class="container">
-        <div class="grid">
-          ${cards}
-        </div>
-      </div>
-    </section>
-  `;
-
-  res.send(renderPage(req, "Programmes", content));
+  res.send(
+    renderPage(
+      req,
+      "Programmes",
+      `
+        ${pageHeader(
+          "Our Programmes",
+          "Building knowledge, opportunity and safer communities."
+        )}
+        <section class="section">
+          <div class="container grid">${cards}</div>
+        </section>
+      `
+    )
+  );
 });
 
 /* =========================================================
-   CONTACT PAGE
+   CONTACT
 ========================================================= */
 
 app.get("/contact", (req, res) => {
@@ -940,18 +916,18 @@ app.get("/contact", (req, res) => {
 
 app.post("/contact", (req, res) => {
   const name = String(req.body.name || "").trim();
-  const email = String(req.body.email || "").trim().toLowerCase();
+  const email = normalizeEmail(req.body.email);
   const subject = String(req.body.subject || "").trim();
   const message = String(req.body.message || "").trim();
 
   if (
     !name ||
-    !validEmail(email) ||
-    !subject ||
-    !message ||
     name.length > 100 ||
+    !validEmail(email) ||
     email.length > 254 ||
+    !subject ||
     subject.length > 150 ||
+    !message ||
     message.length > 5000
   ) {
     return redirectMessage(
@@ -967,15 +943,13 @@ app.post("/contact", (req, res) => {
       VALUES (?, ?, ?, ?)
     `).run(name, email, subject, message);
 
-    console.log("New contact message received.");
-
     return redirectMessage(
       res,
       "/contact",
       "Thank you. Your message has been received."
     );
   } catch (error) {
-    console.error("Contact message database error:", error.message);
+    console.error("Contact database error:", error.message);
 
     return redirectMessage(
       res,
@@ -986,61 +960,78 @@ app.post("/contact", (req, res) => {
 });
 
 /* =========================================================
-   DONATION / SUPPORT PAGE
-   This records pledges only. It does not process payments.
+   DONATION PAGE
 ========================================================= */
 
 app.get("/donate", (req, res) => {
-  const fields = `
-    <div class="field">
-      <label for="name">Full name</label>
-      <input id="name" name="name" type="text" maxlength="100" required>
-    </div>
-
-    <div class="field">
-      <label for="email">Email address</label>
-      <input id="email" name="email" type="email" maxlength="254" required>
-    </div>
-
-    <div class="field">
-      <label for="amount">Pledge amount (KES)</label>
-      <input id="amount" name="amount" type="number" min="1" max="100000000" step="1" required>
-    </div>
-
-    <div class="field">
-      <label for="message">Message (optional)</label>
-      <textarea id="message" name="message" maxlength="1000"></textarea>
-    </div>
-  `;
-
   const content = `
     ${pageHeader(
       "Support Our Work",
-      "Help support youth rights awareness, access to justice and empowerment."
+      "Help support youth rights awareness, access to justice and youth empowerment."
     )}
 
     <section class="form-wrap">
-      <h2>Make a Pledge</h2>
+      <h2>Donate to Youth Justice Initiative Kenya</h2>
 
-      <p class="muted">
-        This form records an expression of support. It does not collect
-        payment details or transfer money. Payment arrangements must be
-        confirmed separately through an authorized channel.
+      <p>
+        Your support can help us carry out community outreach,
+        youth rights awareness, legal awareness and empowerment activities.
       </p>
 
-      <form method="POST">
-        ${fields}
+      <div class="donation-box">
+        <h3>Donate via M-Pesa</h3>
+        <p>Use the phone number below to contact us about making a donation.</p>
+
+        <div class="phone-number">${DONATION_PHONE}</div>
+
+        <p>
+          <a class="button" href="tel:${DONATION_PHONE}">Call This Number</a>
+        </p>
+
+        <p class="muted">
+          Confirm the recipient and payment details before sending money.
+          This website does not process M-Pesa payments automatically.
+        </p>
+      </div>
+
+      <h2>Make a Support Pledge</h2>
+      <p class="muted">
+        You can also record an expression of support below.
+        Submitting this form does not transfer money.
+      </p>
+
+      <form method="POST" action="/donate">
+        <div class="field">
+          <label for="name">Full name</label>
+          <input id="name" name="name" type="text" maxlength="100" required>
+        </div>
+
+        <div class="field">
+          <label for="email">Email address</label>
+          <input id="email" name="email" type="email" maxlength="254" required>
+        </div>
+
+        <div class="field">
+          <label for="amount">Pledge amount (KES)</label>
+          <input id="amount" name="amount" type="number" min="1" max="100000000" step="1" required>
+        </div>
+
+        <div class="field">
+          <label for="message">Message (optional)</label>
+          <textarea id="message" name="message" maxlength="1000"></textarea>
+        </div>
+
         <button class="button" type="submit">Submit Pledge</button>
       </form>
     </section>
   `;
 
-  res.send(renderPage(req, "Support Us", content));
+  res.send(renderPage(req, "Donate", content));
 });
 
 app.post("/donate", (req, res) => {
   const name = String(req.body.name || "").trim();
-  const email = String(req.body.email || "").trim().toLowerCase();
+  const email = normalizeEmail(req.body.email);
   const amount = Number(req.body.amount);
   const message = String(req.body.message || "").trim();
 
@@ -1068,15 +1059,13 @@ app.post("/donate", (req, res) => {
       VALUES (?, ?, ?, ?)
     `).run(name, email, amount, message);
 
-    console.log("A new support pledge was recorded.");
-
     return redirectMessage(
       res,
       "/donate",
-      "Thank you for your support pledge. This form has not processed a payment."
+      "Thank you for your support pledge. No payment was processed."
     );
   } catch (error) {
-    console.error("Pledge database error:", error.message);
+    console.error("Donation pledge error:", error.message);
 
     return redirectMessage(
       res,
@@ -1098,39 +1087,21 @@ app.get("/signup", (req, res) => {
   const fields = `
     <div class="field">
       <label for="name">Full name</label>
-      <input
-        id="name"
-        name="name"
-        type="text"
-        maxlength="100"
-        autocomplete="name"
-        required
-      >
+      <input id="name" name="name" type="text" maxlength="100"
+             autocomplete="name" required>
     </div>
 
     <div class="field">
       <label for="email">Email address</label>
-      <input
-        id="email"
-        name="email"
-        type="email"
-        maxlength="254"
-        autocomplete="email"
-        required
-      >
+      <input id="email" name="email" type="email" maxlength="254"
+             autocomplete="email" required>
     </div>
 
     <div class="field">
       <label for="password">Password</label>
-      <input
-        id="password"
-        name="password"
-        type="password"
-        minlength="8"
-        maxlength="128"
-        autocomplete="new-password"
-        required
-      >
+      <input id="password" name="password" type="password"
+             minlength="8" maxlength="128"
+             autocomplete="new-password" required>
       <small>Use at least 8 characters.</small>
     </div>
   `;
@@ -1148,7 +1119,7 @@ app.get("/signup", (req, res) => {
 
 app.post("/signup", async (req, res) => {
   const name = String(req.body.name || "").trim();
-  const email = String(req.body.email || "").trim().toLowerCase();
+  const email = normalizeEmail(req.body.email);
   const password = String(req.body.password || "");
 
   if (
@@ -1186,9 +1157,11 @@ app.post("/signup", async (req, res) => {
       VALUES (?, ?, ?)
     `).run(name, email, passwordHash);
 
+    console.log("Account created for user ID:", result.lastInsertRowid);
+
     req.session.regenerate(error => {
       if (error) {
-        console.error("Session regeneration error:", error.message);
+        console.error("Signup session error:", error.message);
 
         return redirectMessage(
           res,
@@ -1201,7 +1174,7 @@ app.post("/signup", async (req, res) => {
 
       req.session.save(saveError => {
         if (saveError) {
-          console.error("Session save error:", saveError.message);
+          console.error("Signup session save error:", saveError.message);
 
           return redirectMessage(
             res,
@@ -1210,11 +1183,19 @@ app.post("/signup", async (req, res) => {
           );
         }
 
-        res.redirect("/dashboard");
+        return res.redirect("/dashboard");
       });
     });
   } catch (error) {
     console.error("Signup error:", error.message);
+
+    if (String(error.message).includes("UNIQUE constraint failed")) {
+      return redirectMessage(
+        res,
+        "/signup",
+        "An account with that email already exists. Please log in."
+      );
+    }
 
     return redirectMessage(
       res,
@@ -1236,26 +1217,14 @@ app.get("/login", (req, res) => {
   const fields = `
     <div class="field">
       <label for="email">Email address</label>
-      <input
-        id="email"
-        name="email"
-        type="email"
-        maxlength="254"
-        autocomplete="email"
-        required
-      >
+      <input id="email" name="email" type="email" maxlength="254"
+             autocomplete="email" required>
     </div>
 
     <div class="field">
       <label for="password">Password</label>
-      <input
-        id="password"
-        name="password"
-        type="password"
-        maxlength="128"
-        autocomplete="current-password"
-        required
-      >
+      <input id="password" name="password" type="password"
+             maxlength="128" autocomplete="current-password" required>
     </div>
 
     <p><a href="/forgot-password">Forgot your password?</a></p>
@@ -1274,10 +1243,12 @@ app.get("/login", (req, res) => {
 });
 
 app.post("/login", async (req, res) => {
-  const email = String(req.body.email || "").trim().toLowerCase();
+  const email = normalizeEmail(req.body.email);
   const password = String(req.body.password || "");
 
-  if (!validEmail(email) || password.length > 128 || !password) {
+  if (!validEmail(email) || password.length === 0 || password.length > 128) {
+    console.warn("Login rejected: invalid form input.");
+
     return redirectMessage(
       res,
       "/login",
@@ -1286,14 +1257,17 @@ app.post("/login", async (req, res) => {
   }
 
   try {
-    const user = db
-      .prepare("SELECT id, password_hash FROM users WHERE email = ?")
-      .get(email);
+    // Case-insensitive email lookup also handles older email capitalization.
+    const user = db.prepare(`
+      SELECT id, name, email, password_hash
+      FROM users
+      WHERE LOWER(TRIM(email)) = ?
+      LIMIT 1
+    `).get(email);
 
-    const passwordMatches =
-      user && (await bcrypt.compare(password, user.password_hash));
+    if (!user) {
+      console.warn("Login failed: no account found for submitted email.");
 
-    if (!passwordMatches) {
       return redirectMessage(
         res,
         "/login",
@@ -1301,9 +1275,41 @@ app.post("/login", async (req, res) => {
       );
     }
 
+    if (
+      typeof user.password_hash !== "string" ||
+      !user.password_hash.startsWith("$2")
+    ) {
+      console.error(
+        "Login failed: stored password hash is missing or invalid for user ID:",
+        user.id
+      );
+
+      return redirectMessage(
+        res,
+        "/login",
+        "Your password record needs to be reset. Please contact the website administrator."
+      );
+    }
+
+    const passwordMatches = await bcrypt.compare(
+      password,
+      user.password_hash
+    );
+
+    if (!passwordMatches) {
+      console.warn("Login failed: password did not match for user ID:", user.id);
+
+      return redirectMessage(
+        res,
+        "/login",
+        "Invalid email or password."
+      );
+    }
+
+    // Create a fresh session after successful authentication.
     req.session.regenerate(error => {
       if (error) {
-        console.error("Login session error:", error.message);
+        console.error("Login session regeneration error:", error.message);
 
         return redirectMessage(
           res,
@@ -1325,7 +1331,9 @@ app.post("/login", async (req, res) => {
           );
         }
 
-        res.redirect("/dashboard");
+        console.log("Login successful for user ID:", user.id);
+
+        return res.redirect("/dashboard");
       });
     });
   } catch (error) {
@@ -1361,30 +1369,24 @@ app.get("/dashboard", requireLogin, (req, res) => {
         <div class="dashboard-card">
           <h2>Welcome, ${escapeHTML(user.name)}!</h2>
 
-          <p>
-            You are logged in to the Youth Justice Initiative Kenya
-            member area.
-          </p>
+          <p>You are logged in to the Youth Justice Initiative Kenya member area.</p>
 
           <p><strong>Name:</strong> ${escapeHTML(user.name)}</p>
           <p><strong>Email:</strong> ${escapeHTML(user.email)}</p>
-          <p>
-            <strong>Member since:</strong>
-            ${escapeHTML(user.created_at)}
-          </p>
+          <p><strong>Member since:</strong> ${escapeHTML(user.created_at)}</p>
         </div>
 
         <div class="dashboard-card">
           <h2>Get Involved</h2>
-
           <p>
-            Explore our programmes, contact the initiative or share
-            information about opportunities and potential partnerships.
+            Explore our programmes, contact the initiative or support
+            our work for youth rights and access to justice.
           </p>
 
           <div class="dashboard-actions">
             <a class="button" href="/programmes">Explore Programmes</a>
             <a class="button" href="/contact">Contact Us</a>
+            <a class="button" href="/donate">Support Our Work</a>
             <a class="button button-secondary" href="/privacy">Privacy Policy</a>
           </div>
         </div>
@@ -1405,8 +1407,13 @@ app.post("/logout", (req, res) => {
       console.error("Logout error:", error.message);
     }
 
-    res.clearCookie("yjik.sid");
-    res.redirect("/");
+    res.clearCookie("yjik.sid", {
+      httpOnly: true,
+      secure: NODE_ENV === "production",
+      sameSite: "lax"
+    });
+
+    return res.redirect("/");
   });
 });
 
@@ -1418,14 +1425,8 @@ app.get("/forgot-password", (req, res) => {
   const fields = `
     <div class="field">
       <label for="email">Email address</label>
-      <input
-        id="email"
-        name="email"
-        type="email"
-        maxlength="254"
-        autocomplete="email"
-        required
-      >
+      <input id="email" name="email" type="email" maxlength="254"
+             autocomplete="email" required>
     </div>
   `;
 
@@ -1441,7 +1442,7 @@ app.get("/forgot-password", (req, res) => {
 });
 
 app.post("/forgot-password", async (req, res) => {
-  const email = String(req.body.email || "").trim().toLowerCase();
+  const email = normalizeEmail(req.body.email);
 
   if (!validEmail(email) || email.length > 254) {
     return redirectMessage(
@@ -1452,12 +1453,16 @@ app.post("/forgot-password", async (req, res) => {
   }
 
   try {
-    const user = db
-      .prepare("SELECT id, name, email FROM users WHERE email = ?")
-      .get(email);
+    const user = db.prepare(`
+      SELECT id, name, email
+      FROM users
+      WHERE LOWER(TRIM(email)) = ?
+      LIMIT 1
+    `).get(email);
 
     if (user) {
       const rawToken = crypto.randomBytes(32).toString("hex");
+
       const tokenHash = crypto
         .createHash("sha256")
         .update(rawToken)
@@ -1492,7 +1497,7 @@ app.post("/forgot-password", async (req, res) => {
 
       if (!emailSent) {
         console.warn(
-          "Password reset email could not be sent. Configure SMTP settings."
+          "Password reset email was not sent. Configure SMTP settings in Render."
         );
       }
     }
@@ -1564,28 +1569,16 @@ app.get("/reset-password/:token", (req, res) => {
 
     <div class="field">
       <label for="password">New password</label>
-      <input
-        id="password"
-        name="password"
-        type="password"
-        minlength="8"
-        maxlength="128"
-        autocomplete="new-password"
-        required
-      >
+      <input id="password" name="password" type="password"
+             minlength="8" maxlength="128"
+             autocomplete="new-password" required>
     </div>
 
     <div class="field">
       <label for="confirmPassword">Confirm new password</label>
-      <input
-        id="confirmPassword"
-        name="confirmPassword"
-        type="password"
-        minlength="8"
-        maxlength="128"
-        autocomplete="new-password"
-        required
-      >
+      <input id="confirmPassword" name="confirmPassword" type="password"
+             minlength="8" maxlength="128"
+             autocomplete="new-password" required>
     </div>
   `;
 
@@ -1652,12 +1645,6 @@ app.post("/reset-password/:token", async (req, res) => {
       db.prepare(`
         UPDATE password_resets
         SET used = 1
-        WHERE id = ?
-      `).run(reset.id);
-
-      db.prepare(`
-        UPDATE password_resets
-        SET used = 1
         WHERE user_id = ?
       `).run(reset.user_id);
     });
@@ -1694,15 +1681,12 @@ app.get("/privacy", (req, res) => {
     <section class="section">
       <div class="container">
         <h2>Information We Collect</h2>
-
         <p>
-          Depending on how you use this website, information may include
-          your name, email address, account details, messages and support
-          pledges you voluntarily submit.
+          Information may include your name, email address, account details,
+          messages and support pledges that you voluntarily submit.
         </p>
 
         <h2>How Information Is Used</h2>
-
         <p>
           Information may be used to manage accounts, respond to enquiries,
           record support pledges, maintain website security and communicate
@@ -1710,34 +1694,27 @@ app.get("/privacy", (req, res) => {
         </p>
 
         <h2>Security and Access</h2>
-
         <p>
           We take reasonable steps to protect information. No website or
           electronic storage system can be guaranteed completely secure.
-          Access to stored information should be restricted to authorized
-          people who need it for legitimate purposes.
         </p>
 
         <h2>Sharing Information</h2>
-
         <p>
-          Personal information should not be sold. Information may need
-          to be disclosed where required by law or to address legitimate
-          security and operational requirements.
+          Personal information should not be sold. Information may be
+          disclosed where required by law or for legitimate security
+          and operational requirements.
         </p>
 
         <h2>Your Choices</h2>
-
         <p>
           For questions or requests concerning information submitted
-          through this website, please contact us through the
-          <a href="/contact">contact page</a>.
+          through this website, please use our <a href="/contact">contact page</a>.
         </p>
 
         <p class="muted">
-          This is a general website privacy notice and should be reviewed
-          against the initiative's actual practices and applicable Kenyan
-          data protection requirements before publication.
+          Review this notice against the initiative's actual practices
+          and applicable Kenyan data protection requirements before publication.
         </p>
       </div>
     </section>
@@ -1797,7 +1774,9 @@ app.use((error, req, res, next) => {
 ========================================================= */
 
 const server = app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Youth Justice Initiative Kenya server listening on port ${PORT}`);
+  console.log(
+    `Youth Justice Initiative Kenya server listening on port ${PORT}`
+  );
   console.log(`Environment: ${NODE_ENV}`);
   console.log(`Database: ${path.join(DATA_DIR, "yjik.sqlite")}`);
 });
