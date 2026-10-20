@@ -254,6 +254,7 @@ function renderPage(req, title, content) {
 <html lang="en">
 <head>
   <meta charset="UTF-8">
+  <meta name="google-site-verification" content="p83dVTmvySMYLFxS0P2IcKykFssW4LaBMCRjWEVh21w" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="description" content="Youth Justice Initiative Kenya promotes youth rights, access to justice, legal awareness, community safety and youth empowerment.">
   <title>${escapeHTML(title)} | Youth Justice Initiative Kenya</title>
