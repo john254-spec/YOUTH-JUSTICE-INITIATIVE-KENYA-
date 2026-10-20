@@ -256,6 +256,8 @@ function renderPage(req, title, content) {
   <meta charset="UTF-8">
   <meta name="google-site-verification" content="p83dVTmvySMYLFxS0P2IcKykFssW4LaBMCRjWEVh21w" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-4200131324754790"
+     crossorigin="anonymous"></script>
   <meta name="description" content="Youth Justice Initiative Kenya promotes youth rights, access to justice, legal awareness, community safety and youth empowerment.">
   <title>${escapeHTML(title)} | Youth Justice Initiative Kenya</title>
 
