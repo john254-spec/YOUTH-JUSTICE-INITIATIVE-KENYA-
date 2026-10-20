@@ -1,0 +1,12 @@
+User-agent: *
+Allow: /
+
+Disallow: /dashboard
+Disallow: /login
+Disallow: /signup
+Disallow: /logout
+Disallow: /forgot-password
+Disallow: /reset-password/
+Disallow: /health
+
+Sitemap: https://youth-justice-initiative-kenya.onrender.com/sitemap.xml
